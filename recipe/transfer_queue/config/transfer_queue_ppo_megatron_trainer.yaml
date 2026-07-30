@@ -1,0 +1,24 @@
+# ============================================================
+# TransferQueue PPO 训练器配置文件（Megatron 后端）
+# ============================================================
+# 用途：配置基于 TransferQueue + Megatron 后端的 PPO 训练流程
+# 关键配置项：
+#   - defaults: 继承标准 ppo_megatron_trainer 配置
+#   - transfer_queue 部分同 transfer_queue_ppo_trainer.yaml
+# 与其他 recipe 的区别：与 FSDP 版本类似，但底层使用 Megatron
+# 作为模型并行后端，适用于超大规模模型训练。
+# ============================================================
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_megatron_trainer
+  - _self_
+
+# config for TransferQueue
+transfer_queue:
+  enable: True
+  num_global_batch: 1
+  storage_backend: AsyncSimpleStorageManager
+  num_data_storage_units: 8

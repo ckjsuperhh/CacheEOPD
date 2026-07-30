@@ -1,0 +1,40 @@
+# ==============================================================================
+# One-Step-Off Policy PPO 训练器配置文件（FSDP 后端）
+# ==============================================================================
+# 用途：配置 One-Step-Off Policy 的 PPO 训练流程，基于 FSDP 后端
+# 继承自 verl 默认 ppo_trainer 配置，在此基础上添加：
+#   - rollout 独立资源池配置（nnodes, n_gpus_per_node）
+#
+# 与标准 ppo_trainer 的区别：
+#   - Actor 和 Rollout 使用独立的 GPU 资源池（分离架构）
+#   - 使用异步 rollout 管理器实现一步超前训练
+# ==============================================================================
+
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+# config for the rollout (only for resource isolation)
+rollout:
+  # Number of nodes used in the rollout
+  nnodes: 1
+  # Number of GPUs per node
+  n_gpus_per_node: 8
+
+# To adapt to the current logic of AgentLoopManager
+actor_rollout_ref:
+  rollout:
+    # Must be turned off! Otherwise, Parameter synchronization cannot be performed.
+    free_cache_engine: False
+    # Must be enabled! Otherwise, log_probs cannot be calculated.
+    calculate_log_probs: True
+
+# Only then will the use of log probs be correct.
+# And it can be used in conjunction with other rollout_correction algorithms.
+algorithm:
+  rollout_correction:
+    bypass_mode: True

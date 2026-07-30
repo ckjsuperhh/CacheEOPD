@@ -1,0 +1,100 @@
+# ============================================================================
+# PRIME 训练器配置文件
+#
+# 本配置继承自 verl/trainer/config/ppo_trainer.yaml，覆盖 PRIME 算法特有的配置项。
+#
+# PRIME（Process Reward Model for Implicit Process Reward）的核心特点：
+#   - 在线训练过程奖励模型（PRM），使用 DPO 风格损失更新
+#   - 使用 RLOO（Leave-One-Out）优势函数估计，无需 Critic 模型
+#   - 支持数据过滤：按准确率和截断长度过滤训练样本
+#
+# 与其他 recipe 的主要区别：
+#   - dapo: 无在线 RM，使用纯 outcome reward
+#   - r1: 使用固定 reward function，无 RM
+#   - sppo: 使用 SPPO 算法，无 PRM
+#
+# 关键配置项说明：
+#   - reward_model.model.update: RM 更新策略（before/after/reverse/none）
+#   - reward_model.model.beta_train: DPO 损失的温度系数
+#   - reward_model.model.loss_type: RM 损失类型（ce/dpo/bon_acc/bon_rm）
+#   - reward_model.prime_granularity: 奖励分配粒度（token/whole）
+#   - algorithm.reward_gt_coef: ground truth 奖励系数
+#   - algorithm.reward_dpo_coef: DPO 奖励系数
+# ============================================================================
+
+# the prime config will override default ppo_trainer.yaml
+
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+data:
+  filter_accuracy: True
+  accuracy_lower_bound: 0.2
+  accuracy_upper_bound: 0.8
+  oversample_factor: 4.0 # Sample more responses than the batch size. prompts satisfying the filter will be prioritized.
+  filter_truncate: True
+  truncation: right
+
+actor_rollout_ref:
+  hybrid_engine: True
+  model:
+    use_remove_padding: True
+  rollout:
+    # number of responses (i.e. num sample times)
+    n: 4
+  actor:
+    entropy_coeff: 0.001
+
+reward_model:
+  enable: True
+  strategy: fsdp
+  model:
+    ref_path: ${reward_model.model.path}
+    use_remove_padding:  True
+    use_fused_kernels: ${actor_rollout_ref.model.use_fused_kernels}
+    fused_kernel_options:
+      impl_backend: torch # triton, torch
+    tokenizer_path: ${actor_rollout_ref.model.path}
+    enable_gradient_checkpointing: ${actor_rollout_ref.model.enable_gradient_checkpointing}
+    ref_type: freeze
+    fsdp_config:
+      min_num_params: 0
+      param_offload: ${actor_rollout_ref.actor.fsdp_config.param_offload}
+      optimizer_offload: ${actor_rollout_ref.actor.fsdp_config.optimizer_offload}
+    update: before # ``before`` for double-forward, ``after`` for single-forward
+    optim:
+      lr: 1e-6
+      lr_warmup_steps: -1 # Prioritized. Negative values mean delegating to lr_warmup_steps_ratio.
+      lr_warmup_steps_ratio: 0.  # the total steps will be injected during runtime
+      min_lr_ratio: null
+      warmup_style: null # deprecated
+      lr_scheduler_type: constant
+      total_training_steps: -1  # must be overridden by program
+      weight_decay: 0.
+      grad_clip: 10.0
+    beta_train: 0.05
+    loss_type: ce # currently only supports ce loss
+  prime_granularity: token
+  prime_norm: batch_norm # batch_norm or none. if set to none, the normalizer is beta_train
+  mini_batch_size: ${actor_rollout_ref.actor.ppo_mini_batch_size}
+  reward_manager: prime
+
+algorithm:
+  adv_estimator: rloo
+  # now supports rloo. it treats different source of reward separately.
+  kl_ctrl:
+    type: fixed
+    kl_coef: 0.000
+  reward_gt_coef: 5
+  reward_dpo_coef: 5
+
+trainer:
+  project_name: prime
+  experiment_name: examples
+  val_before_train: False
+  balance_batch: False

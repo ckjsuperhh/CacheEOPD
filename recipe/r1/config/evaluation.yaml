@@ -1,0 +1,19 @@
+# ============================================================
+# R1 评估配置文件
+# 配置评估数据集路径、字段映射和自定义奖励评分函数，
+# 用于对 R1 模型生成的回答进行离线评估。
+# ============================================================
+data:
+  path: /tmp/math_Qwen2-7B-Instruct.parquet
+  prompt_key: prompt
+  response_key: responses
+  data_source_key: data_source
+  reward_model_key: reward_model
+
+custom_reward_function:
+  path: null
+  name: compute_score
+
+ray_kwargs:
+  ray_init:
+    num_cpus: null # `None` means using all CPUs, which might cause hang if limited in systems like SLURM. Please set to a number allowed then.

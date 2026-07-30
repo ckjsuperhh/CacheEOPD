@@ -1,0 +1,33 @@
+# =============================================================================
+# requirements.txt - EOPD/verl 开发环境完整依赖列表
+# =============================================================================
+# 本文件记录了开发阶段所需的全部依赖包。
+# 安装方式：pip install -r requirements.txt
+# 注意：setup.py 中的 install_requires 是用户安装时的最小依赖集，
+# 而本文件包含更多开发/调试所需的包。
+
+accelerate           # HuggingFace 分布式训练加速库，支持多 GPU/多节点训练
+codetiming           # 代码块执行时间测量工具，用于性能分析
+datasets             # HuggingFace 数据集库，用于加载和处理训练数据
+dill                 # 增强的 Python 序列化库（pickle 的超集）
+hydra-core           # Meta 的配置管理框架，verl 用 Hydra 管理训练超参数
+liger-kernel         # LinkedIn 的 GPU 高效内核，加速 LLM 训练
+numpy<2.0.0          # 数值计算基础库（限制 <2.0 以保持与其他库的兼容性）
+pandas               # 结构化数据处理与分析库
+peft                 # HuggingFace 参数高效微调库（支持 LoRA、Adapter 等）
+pyarrow>=19.0.0      # Apache Arrow Python 绑定，用于读写 Parquet 数据格式
+pybind11             # C++/Python 互操作绑定工具，用于编译 C++ 扩展
+pylatexenc           # LaTeX 编解码库，用于数学推理任务中的公式处理
+pre-commit           # Git pre-commit 钩子管理工具，确保代码提交前通过检查
+ray[default]         # Ray 分布式计算框架，verl 的核心任务调度引擎
+tensordict>=0.8.0,<=0.10.0,!=0.9.0  # PyTorch 张量字典，RL 训练中传递 batch 数据
+torchdata            # PyTorch 数据加载与预处理工具库
+transformers         # HuggingFace Transformers，LLM 模型加载、推理和微调
+# vllm==0.8.4        # vLLM 推理引擎（此处注释掉，通过 extras 安装）
+wandb                # Weights & Biases 实验追踪与可视化平台
+packaging>=20.0      # Python 包版本解析与比较工具
+uvicorn              # ASGI 服务器，用于奖励模型/教师模型的 API 服务
+fastapi              # 高性能 Web 框架，用于构建模型推理 API 服务
+latex2sympy2_extended # LaTeX 到 SymPy 的转换工具（扩展版），用于数学表达式解析
+math_verify           # 数学答案验证库，EOPD 中用于数学推理任务的奖励评分
+tensorboard          # Google TensorBoard 训练日志可视化工具

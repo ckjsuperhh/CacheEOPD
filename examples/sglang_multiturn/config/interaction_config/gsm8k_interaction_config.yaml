@@ -1,0 +1,7 @@
+# =============================================================================
+# 交互配置 — gsm8k_interaction_config
+# =============================================================================
+interaction:
+  - name: "gsm8k"
+    class_name: "verl.interactions.gsm8k_interaction.Gsm8kInteraction"
+    config: {}

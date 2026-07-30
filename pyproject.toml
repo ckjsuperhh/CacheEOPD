@@ -1,0 +1,127 @@
+# =============================================================================
+# pyproject.toml - EOPD/verl 项目的 Python 包构建与工具配置文件
+# =============================================================================
+# 本文件遵循 PEP 517/518/621 标准，定义了：
+#   1. 构建系统（build-system）：使用 setuptools 作为构建后端
+#   2. 项目元数据（project）：包名、描述、许可证等
+#   3. Ruff 代码风格检查配置
+#   4. mypy 类型检查配置
+#   5. setuptools 的包数据配置
+
+# -------------------------------
+# 构建系统配置（PEP 517/518）
+# -------------------------------
+[build-system]
+requires = [
+    "setuptools>=61.0",  # 要求 setuptools 61.0+，支持 PEP 621 元数据
+    "wheel"              # 用于构建 wheel 分发包
+]
+build-backend = "setuptools.build_meta"  # 使用 setuptools 作为 PEP 517 构建后端
+
+# -------------------------------
+# 项目元数据（PEP 621）
+# -------------------------------
+[project]
+name = "verl"  # 包名：verl（Volcano Engine Reinforcement Learning）
+# 版本号、依赖、作者等信息标记为"动态"，从 setup.py 或文件中读取
+# （PEP 621 中称为 "dynamic" 字段）
+# 实际版本号在 [tool.setuptools.dynamic] 部分指定
+dynamic = ["version", "dependencies", "optional-dependencies", "authors", "urls"]
+
+description = "verl: Volcano Engine Reinforcement Learning for LLM"  # 项目简短描述
+license = {text = "Apache-2.0"}  # 许可证类型（从文件改为文本格式以兼容 PEP 639）
+readme = {file = "README.md", content-type = "text/markdown"}  # README 文件作为 PyPI 长描述
+requires-python = ">=3.10"  # 要求 Python 3.10 及以上版本
+
+# -------------------------------
+# Ruff 代码风格检查与格式化配置
+# -------------------------------
+[tool.ruff]
+# 注意：格式化器会尽量让行保持在 line-length 以内，
+# 但这不是一个硬性上限，格式化后的行可能超过此长度
+line-length = 120  # 每行最大 120 个字符
+exclude = ["scripts/legacy_model_merger.py"]  # 排除旧版模型合并脚本
+
+[tool.ruff.lint]
+isort = {known-first-party = ["verl"]}  # isort 配置：将 verl 标记为第一方库
+# 启用的检查规则列表
+# 参考：https://github.com/vllm-project/vllm/blob/ce8d6b75fc0586045df75ee1568a5b5f9957251b/pyproject.toml
+select = [
+    # pycodestyle 代码风格检查
+    "E",
+    # Pyflakes 静态分析（未使用变量/导入等）
+    "F",
+    # pyupgrade 自动升级 Python 语法
+    "UP",
+    # flake8-bugbear 常见 Bug 检测
+    "B",
+    # isort 导入排序
+    "I",
+    "G",  # flake8-logging-format 日志格式化检查
+]
+# 忽略的规则列表
+ignore = [
+    # 允许星号导入（from xxx import *）
+    "F405", "F403",
+    # 允许 lambda 表达式赋值（如 f = lambda x: x）
+    "E731",
+    # 允许循环控制变量在循环体内未使用
+    "B007",
+    # 允许 f-string 格式化（不强制使用 .format()）
+    "UP032",
+    # 允许 .log() 中使用 f-string
+    "G004",
+    # 允许使用 Optional[X] 而非 X | None（兼容旧版 Python）
+    "UP045",
+    # 忽略已弃用的导入警告
+    "UP035",
+]
+
+# -------------------------------
+# mypy 静态类型检查配置
+# -------------------------------
+[tool.mypy]
+pretty            = true              # 美化输出格式
+ignore_missing_imports = true          # 忽略缺失的第三方库类型存根
+explicit_package_bases = true          # 显式声明包的基础路径
+follow_imports = "skip"                # 跳过导入跟踪（避免级联错误）
+
+# 全局忽略所有类型错误（默认关闭类型检查）
+ignore_errors = true
+
+# 对特定模块启用类型检查（覆盖上面的全局设置）
+[[tool.mypy.overrides]]
+module = [
+"verl.trainer.config.algorithm",       # 算法配置模块
+"verl.trainer.ppo.core_algos",          # PPO 核心算法模块
+"verl.trainer.ppo.reward",              # 奖励计算模块
+"verl.workers.reward_manager",          # 奖励管理器模块
+"verl.workers.reward_manager.*",        # 奖励管理器子模块
+]
+ignore_errors = false                   # 对这些关键模块启用严格类型检查
+
+# -------------------------------
+# setuptools 包数据与目录配置
+# -------------------------------
+[tool.setuptools]
+# 设为 true 表示 setuptools 会自动包含所有相关的非 Python 文件
+# 等价于 setup.py 中的 include_package_data=True
+include-package-data = true
+
+# 从 verl/version/version 文件中动态读取版本号
+[tool.setuptools.dynamic]
+version = {file = "verl/version/version"}
+
+# 包目录映射：将根目录映射为包的搜索路径
+# 等价于 setup.py 中的 package_dir={'': '.'}
+[tool.setuptools.package-dir]
+"" = "."
+
+# 包含的非 Python 数据文件（如 YAML 配置、版本文件）
+# 等价于 setup.py 中的 package_data
+[tool.setuptools.package-data]
+verl = [
+  "version/*",                    # 版本号文件
+  "trainer/config/*.yaml",        # 训练器一级配置文件
+  "trainer/config/*/*.yaml",      # 训练器子目录配置文件
+]

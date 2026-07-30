@@ -1,0 +1,64 @@
+# FAPO 奖励模型配置文件
+#
+# 该文件定义了 FAPO 中 GenRM（生成式奖励模型）的配置。
+# 基于 Hydra 配置系统，继承自 verl 的 ppo_trainer 默认配置。
+#
+# 关键配置项：
+# - reward_model.reward_manager: 使用 DAPO 的奖励管理器
+# - reward_model.enable: 是否启用奖励模型（False 表示仅使用规则奖励）
+# - reward_model.enable_resource_pool: 是否将 GenRM 部署在独立的资源池
+# - reward_model.model: GenRM 模型配置（类型、路径等）
+# - reward_model.rollout: GenRM 推理引擎配置
+#
+# 与其他 recipe 的区别：
+# FAPO 额外引入了 GenRM 作为过程奖励模型，用于检测"有缺陷的正面样本"
+
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+reward_model:
+  _target_: verl.workers.config.RewardModelConfig
+
+  reward_manager: dapo
+  enable: False
+
+  # Whether to deploy the model to a separate resource pool.
+  enable_resource_pool: False
+  n_gpus_per_node: 0
+  nnodes: 0
+
+  model:
+    type: discriminative
+    path: ~/models/FsfairX-LLaMA3-RM-v0.1
+    external_lib: ${actor_rollout_ref.model.external_lib}
+    trust_remote_code: False
+
+  rollout:
+    _target_: verl.workers.config.RolloutConfig
+    name: ???
+    dtype: bfloat16
+    gpu_memory_utilization: 0.5
+    enforce_eager: true
+    cudagraph_capture_sizes: null
+    free_cache_engine: true
+    data_parallel_size: 1
+    expert_parallel_size: 1
+    tensor_model_parallel_size: 2
+    max_num_batched_tokens: 8192
+    max_model_len: null
+    max_num_seqs: 1024
+    load_format: auto
+    engine_kwargs: {}
+    limit_images: null
+    enable_chunked_prefill: true
+    enable_prefix_caching: true
+    disable_log_stats: true
+    skip_tokenizer_init: true
+
+    prompt_length: 512
+    response_length: 512

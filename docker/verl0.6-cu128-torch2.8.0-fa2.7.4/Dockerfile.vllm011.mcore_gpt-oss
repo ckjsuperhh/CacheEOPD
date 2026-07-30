@@ -1,0 +1,31 @@
+# ============================================================================
+# Docker 镜像: verl 0.6 + vLLM 0.11.0 + NeMo GPT-OSS
+# ============================================================================
+# 用途: 基于 NVIDIA NeMo GPT-OSS 镜像，集成 vLLM 0.11.0 推理引擎
+# 基础镜像: nvcr.io/nvidia/nemo:25.07.gpt_oss (NVIDIA NeMo GPT 开源训练框架)
+# 主要安装: vLLM 0.11.0、transformers、mbridge、codetiming 等辅助包
+# ============================================================================
+
+# 基于 NVIDIA NeMo GPT-OSS 镜像
+FROM nvcr.io/nvidia/nemo:25.07.gpt_oss
+
+# 克隆 vLLM v0.11.0 并以可编辑模式安装（无依赖、无构建隔离）
+RUN git clone -b v0.11.0 --depth 1 https://github.com/vllm-project/vllm.git /opt/vllm
+
+# 安装 setuptools_scm (版本管理工具)
+RUN pip install setuptools_scm
+
+# 安装 vLLM（无依赖模式）
+RUN cd /opt/vllm && pip install --no-deps --no-build-isolation --no-cache-dir -e .
+
+# 安装 vLLM 额外依赖：cbor2、setproctitle、blake3、openai_harmony 等
+RUN pip install cbor2 setproctitle blake3 openai_harmony pybase64 msgspec partial_json_parser py-cpuinfo diskcache gguf
+
+# 升级 transformers 和 tokenizers
+RUN pip install --upgrade transformers tokenizers
+
+# 安装辅助工具包
+RUN pip install codetiming tensordict mathruler pylatexenc
+
+# 安装 mbridge (模型桥接工具)
+RUN pip3 install --no-cache-dir mbridge

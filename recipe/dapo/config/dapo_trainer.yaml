@@ -1,0 +1,49 @@
+# =============================================================================
+# DAPO 训练器配置文件（FSDP 版本）
+#
+# 用途：配置 DAPO（Decoupled Clip and Dynamic Sampling Policy Optimization）
+#       算法的训练参数，继承自 verl 框架的 ppo_trainer 基础配置。
+#
+# 关键配置项说明：
+#   - reward_model.reward_manager: 使用 DAPO 专用的奖励管理器（DAPORewardManager）
+#   - reward_model.overlong_buffer: 过长输出惩罚缓冲区配置，当输出长度超过
+#     max_response_length - overlong_buffer.len 时开始线性增加惩罚
+#   - algorithm.filter_groups: DAPO 核心的动态采样（组过滤）机制
+#     enable=True 时过滤掉所有输出奖励相同的 prompt 组
+#     metric 指定过滤依据的指标（如 acc/score/seq_reward 等）
+#     max_num_gen_batches 限制最大生成批次数，防止无限循环
+#   - data.gen_batch_size: 每次生成的 batch 大小，可与 train_batch_size 不同
+#
+# 与标准 ppo_trainer 的区别：
+#   - 使用 DAPO 专用 reward_manager 支持动态采样
+#   - 增加了 filter_groups 组过滤配置
+#   - 增加了 overlong_buffer 过长惩罚配置
+# =============================================================================
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+data:
+  gen_batch_size: ${data.train_batch_size}
+
+reward_model:
+  reward_manager: dapo
+  overlong_buffer: 
+    enable: False # We try to avoid forgetting to set enable
+    len: 0
+    penalty_factor: 0.0
+    log: False
+
+algorithm:
+  filter_groups:
+    _target_: verl.trainer.config.FilterGroupsConfig
+    enable: False # We try to avoid forgetting to set enable
+    metric: null # acc / score / seq_reward / seq_final_reward / ...
+    max_num_gen_batches: 0 # Non-positive values mean no upper limit
+
+trainer:
+  project_name: verl-dapo

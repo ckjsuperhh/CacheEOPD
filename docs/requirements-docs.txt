@@ -1,0 +1,19 @@
+# =============================================================================
+# requirements-docs.txt - 文档构建专用依赖列表
+# =============================================================================
+# 本文件列出构建 verl 在线文档（Sphinx + Read the Docs）所需的依赖。
+# 仅在文档构建时安装，用户无需关心。
+
+# Markdown 格式支持
+recommonmark            # Recommonmark：在 Sphinx 中支持 Markdown 文件
+myst_parser             # MyST Parser：更强大的 Markdown 解析器（支持扩展语法）
+# Markdown 表格支持
+sphinx-markdown-tables  # Sphinx 扩展：渲染 Markdown 格式的表格
+
+# HTML 主题
+# 使用 Read the Docs 官方主题
+# crate-docs-theme
+sphinx-rtd-theme        # sphinx-rtd-theme：Read the Docs 标准文档主题
+
+# 固定 tokenizers 版本以避免 env_logger 版本冲突
+tokenizers==0.21        # HuggingFace Tokenizers（固定版本避免依赖冲突）

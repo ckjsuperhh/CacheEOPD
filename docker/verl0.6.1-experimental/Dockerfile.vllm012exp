@@ -1,0 +1,103 @@
+# ============================================================================
+# Docker 镜像: verl 0.6.1 实验版 + vLLM 0.12.0
+# ============================================================================
+# 目标标签: verlai/verl:vll012.exp
+# 基础镜像: nvcr.io/nvidia/pytorch:25.11-py3 (NVIDIA PyTorch 25.11)
+# 主要安装:
+#   - vLLM v0.12.0 (从源码安装)
+#   - TransformerEngine v2.11、Flash-Attention
+#   - HybridEP (DeepEP 混合专家并行分支)
+#   - causal-conv1d + flash-linear-attention (Qwen3-Next 依赖)
+#   - Nsight Systems 2025.6.1
+#   - Megatron-LM (最新开发分支)、mbridge
+#   - verl v0.6.1
+# ============================================================================
+
+# 目标标签: verlai/verl:vll012.exp
+# dockerfile for verlai/verl:vll012.exp
+# 基于 NVIDIA PyTorch 25.11 镜像
+FROM nvcr.io/nvidia/pytorch:25.11-py3
+
+# 克隆 vLLM v0.12.0 源码
+RUN git clone -b v0.12.0 --depth 1 https://github.com/vllm-project/vllm.git /opt/vllm
+
+# 安装 setuptools_scm (版本管理工具)
+RUN pip install setuptools_scm
+
+# 以可编辑模式安装 vLLM（无依赖）
+RUN cd /opt/vllm && pip install --no-deps --no-build-isolation --no-cache-dir -e .
+
+# 安装 vLLM 公共依赖
+RUN pip install -r /opt/vllm/requirements/common.txt
+
+
+# 安装 pybind11
+RUN pip install pybind11
+
+# 安装 TransformerEngine v2.11
+RUN export NVTE_FRAMEWORK=pytorch && MAX_JOBS=128 NVTE_BUILD_THREADS_PER_JOB=4 pip3 install --resume-retries 999 --no-cache-dir --no-build-isolation git+https://github.com/NVIDIA/TransformerEngine.git@release_v2.11
+
+# 升级 transformers 和 tokenizers
+RUN pip install --upgrade --no-cache-dir transformers tokenizers
+
+# 安装辅助工具包
+RUN pip install codetiming tensordict mathruler pylatexenc qwen_vl_utils
+
+# 安装 Flash-Attention
+RUN pip install flash_attn
+#==2.8.1
+
+# 安装 numactl (NUMA 内存管理工具)
+RUN apt update && apt install numactl
+
+# 安装 Nsight Systems 2025.6.1 性能分析工具
+RUN NSIGHT_VERSION=2025.6.1_2025.6.1.190-1_$(if [ "$(uname -m)" = "aarch64" ]; then echo "arm64"; else echo "amd64"; fi) && \
+    wget https://developer.nvidia.com/downloads/assets/tools/secure/nsight-systems/2025_6/nsight-systems-${NSIGHT_VERSION}.deb && \
+    apt-get update && apt-get install -y libxcb-cursor0 && \
+    apt-get install -y ./nsight-systems-${NSIGHT_VERSION}.deb && \
+    rm -rf /usr/local/cuda/bin/nsys && \
+    ln -s /opt/nvidia/nsight-systems/2025.6.1/nsys  /usr/local/cuda/bin/nsys && \
+    rm -rf /usr/local/cuda/bin/nsys-ui && \
+    ln -s /opt/nvidia/nsight-systems/2025.6.1/nsys-ui /usr/local/cuda/bin/nsys-ui && \
+    rm nsight-systems-${NSIGHT_VERSION}.deb
+
+
+# =========================
+# 安装 HybridEP (DeepEP 混合专家并行分支，支持 SM 9.0/10.0 架构)
+# =========================
+WORKDIR /home/
+RUN git clone --branch hybrid-ep https://github.com/deepseek-ai/DeepEP.git && \
+    cd DeepEP && git checkout 3f601f7ac1c062c46502646ff04c535013bfca00 && \
+    TORCH_CUDA_ARCH_LIST="9.0;10.0" pip install --no-build-isolation .
+
+# =========================
+# 安装 Qwen3-Next 模型依赖 (causal-conv1d + flash-linear-attention)
+# =========================
+WORKDIR /home/
+# 安装 causal-conv1d (因果卷积) 和 flash-linear-attention (线性注意力加速)
+# Install causal-conv1d and flash-linear-attention
+RUN cd /tmp && \
+    git clone https://github.com/Dao-AILab/causal-conv1d.git && \
+    cd causal-conv1d && \
+    unset PIP_CONSTRAINT && \
+    CAUSAL_CONV1D_FORCE_BUILD=TRUE pip install --no-build-isolation . && \
+    cd .. && \
+    rm -rf causal-conv1d && \
+    pip install flash-linear-attention
+
+# 安装 trl (Transformer Reinforcement Learning)
+RUN pip3 install --no-cache-dir --no-deps trl
+
+# 安装 nvtx、matplotlib、liger_kernel
+RUN pip3 install nvtx matplotlib liger_kernel
+
+# 安装 mbridge (模型参数桥接)
+RUN pip install -U git+https://github.com/ISEEKYAN/mbridge.git
+
+# 安装 Megatron-LM (最新开发分支, 20251209)
+RUN pip install --no-deps --no-cache-dir git+https://github.com/NVIDIA/Megatron-LM.git@1d462bd37dac21cfa14177405d4921eedb987052 # latest dev branch on 20251209
+
+# 安装 verl v0.6.1 后卸载（仅获取依赖，运行时从源码安装）
+RUN pip install git+https://github.com/volcengine/verl.git@v0.6.1
+
+RUN pip uninstall -y verl

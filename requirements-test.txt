@@ -1,0 +1,11 @@
+# =============================================================================
+# requirements-test.txt - 测试环境依赖列表
+# =============================================================================
+# 本文件包含运行 EOPD/verl 单元测试和集成测试所需的依赖。
+# 安装方式：pip install -r requirements-test.txt
+
+pytest                # Python 测试框架，verl 的主要测试运行器
+pre-commit            # Git 钩子管理工具，提交前自动执行代码检查
+py-spy                # Python 性能分析工具（采样式 profiler）
+pytest-asyncio        # pytest 异步测试插件，支持 async/await 测试函数
+pytest-rerunfailures  # pytest 失败重试插件，自动重跑失败的测试用例

@@ -1,0 +1,103 @@
+# ============================================================================
+# Docker 基础镜像: verl 0.5 预览版 (CUDA 12.8 + PyTorch 2.7.1 + Flash-Attn 2.8.0)
+# ============================================================================
+# 用途: verl 0.5 预览版基础镜像，使用 CUDA 12.8 (较正式版 cu126 更新)
+# 目标标签: verlai/verl:base-verl0.5-preview-cu128-cudnn9.8-torch2.7.1-fa2.8.0-fi0.2.6
+# 基础镜像: nvcr.io/nvidia/pytorch:25.02-py3 (Ubuntu 22.04 + CUDA 12.8 + Python 3.12)
+# 主要安装: PyTorch 2.7.1、Flash-Attn 2.8.0.post2、cuDNN 9.8、Apex、
+#   Nsight Systems 2025.3.1
+# 注意: 此镜像不含推理/训练框架（如 vLLM、SGLang、Megatron 等），
+#       需要由 app 镜像在上层添加
+# ============================================================================
+
+# 基于 NVIDIA 官方 PyTorch 25.02 镜像 (ubuntu-22.04 + cuda-12.8 + python-3.12)
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-02.html
+FROM nvcr.io/nvidia/pytorch:25.02-py3
+
+# 定义环境变量
+ENV MAX_JOBS=16
+ENV VLLM_WORKER_MULTIPROC_METHOD=spawn
+ENV DEBIAN_FRONTEND=noninteractive
+ENV NODE_OPTIONS=""
+ENV PIP_ROOT_USER_ACTION=ignore
+ENV HF_HUB_ENABLE_HF_TRANSFER="1"
+
+# 定义安装源参数（使用清华大学镜像加速）
+ARG APT_SOURCE=https://mirrors.tuna.tsinghua.edu.cn/ubuntu/
+ARG PIP_INDEX=https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+
+# 设置 apt 源为清华大学镜像
+RUN cp /etc/apt/sources.list /etc/apt/sources.list.bak && \
+    { \
+    echo "deb ${APT_SOURCE} jammy main restricted universe multiverse"; \
+    echo "deb ${APT_SOURCE} jammy-updates main restricted universe multiverse"; \
+    echo "deb ${APT_SOURCE} jammy-backports main restricted universe multiverse"; \
+    echo "deb ${APT_SOURCE} jammy-security main restricted universe multiverse"; \
+    } > /etc/apt/sources.list
+
+# 安装 systemctl（系统服务管理）
+RUN apt-get update && \
+    apt-get install -y -o Dpkg::Options::="--force-confdef" systemd && \
+    apt-get clean
+
+# 安装 tini（轻量级 init 进程）、aria2（下载工具）、libfreeimage（图像库）等
+RUN apt-get update && \
+    apt-get install -y tini aria2 libfreeimage3 libfreeimage-dev zlib1g htop && \
+    apt-get clean
+
+# 设置 pip 源为清华大学镜像
+RUN pip config set global.index-url "${PIP_INDEX}" && \
+    pip config set global.extra-index-url "${PIP_INDEX}" && \
+    python -m pip install --upgrade pip
+
+# 卸载 NVIDIA 定制的 PyTorch 分支和相关预装包
+RUN pip uninstall -y torch torchvision torchaudio \
+    pytorch-quantization pytorch-triton torch-tensorrt \
+    xgboost transformer_engine flash_attn apex megatron-core grpcio
+
+# 安装 PyTorch 2.7.1 + CUDA 12.8 版本（含 torchvision、torchaudio）
+RUN pip install --resume-retries 999 --no-cache-dir torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu128
+
+# 安装 Flash-Attention 2.8.0.post2（预编译 wheel，根据 cxx11abi 标志选择）
+RUN ABI_FLAG=$(python -c "import torch; print('TRUE' if torch._C._GLIBCXX_USE_CXX11_ABI else 'FALSE')") && \
+    URL="https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.0.post2/flash_attn-2.8.0.post2+cu12torch2.7cxx11abi${ABI_FLAG}-cp312-cp312-linux_x86_64.whl" && \
+    FILE="flash_attn-2.8.0.post2+cu12torch2.7cxx11abi${ABI_FLAG}-cp312-cp312-linux_x86_64.whl" && \
+    wget -nv "${URL}" && \
+    pip install --no-cache-dir "${FILE}"
+
+# 修复 nvidia-ml-py、fastapi、optree、pydantic、grpcio 等包版本冲突
+RUN pip uninstall -y pynvml nvidia-ml-py && \
+    pip install --no-cache-dir --upgrade "nvidia-ml-py>=12.560.30" "fastapi[standard]>=0.115.0" "optree>=0.13.0" "pydantic>=2.9" "grpcio>=1.62.1"
+
+# 安装 cuDNN 9.8 深度学习加速库
+RUN aria2c --max-tries=9999 https://developer.download.nvidia.com/compute/cudnn/9.8.0/local_installers/cudnn-local-repo-ubuntu2204-9.8.0_1.0-1_amd64.deb && \
+    dpkg -i cudnn-local-repo-ubuntu2204-9.8.0_1.0-1_amd64.deb && \
+    cp /var/cudnn-local-repo-ubuntu2204-9.8.0/cudnn-*-keyring.gpg /usr/share/keyrings/ && \
+    apt-get update && \
+    apt-get -y install cudnn-cuda-12 && \
+    rm cudnn-local-repo-ubuntu2204-9.8.0_1.0-1_amd64.deb
+
+# 安装 NVIDIA Apex（混合精度训练、Fused Adam 等优化器）
+RUN pip install -v --disable-pip-version-check --no-cache-dir --no-build-isolation --config-settings "--build-option=--cpp_ext" --config-settings "--build-option=--cuda_ext" --resume-retries 999 git+https://github.com/NVIDIA/apex.git
+
+# 安装 Nsight Systems 2025.3.1 性能分析工具 (nsys)
+RUN aria2c --always-resume=true --max-tries=99999 https://developer.nvidia.com/downloads/assets/tools/secure/nsight-systems/2025_3/nsight-systems-2025.3.1_2025.3.1.90-1_amd64.deb && \
+    apt-get update && apt-get install -y libxcb-cursor0
+
+RUN apt-get install -y ./nsight-systems-2025.3.1_2025.3.1.90-1_amd64.deb && \
+    rm -rf /usr/local/cuda/bin/nsys && \
+    ln -s /opt/nvidia/nsight-systems/2025.3.1/target-linux-x64/nsys  /usr/local/cuda/bin/nsys && \
+    rm -rf /usr/local/cuda/bin/nsys-ui && \
+    ln -s /opt/nvidia/nsight-systems/2025.3.1/target-linux-x64/nsys-ui /usr/local/cuda/bin/nsys-ui && \
+    rm nsight-systems-2025.3.1_2025.3.1.90-1_amd64.deb
+
+# 安装 verl 相关 Python 依赖包
+RUN pip install --resume-retries 999 --no-cache-dir "tensordict==0.6.2" torchdata "transformers[hf_xet]>=4.51.0" accelerate datasets peft hf-transfer \
+    "numpy<2.0.0" "pyarrow>=19.0.1" pandas cuda-bindings \
+    ray[default] codetiming hydra-core pylatexenc qwen-vl-utils wandb dill pybind11 liger-kernel mathruler blobfile xgrammar \
+    pytest py-spy pre-commit ruff
+
+# 重置 pip 配置为默认源
+RUN pip config unset global.index-url && \
+    pip config unset global.extra-index-url
+

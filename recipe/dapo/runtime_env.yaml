@@ -1,0 +1,17 @@
+# =============================================================================
+# DAPO Ray 运行时环境配置
+#
+# 用途：定义 Ray 集群的运行时环境，在通过 ray job submit 提交任务时生效。
+#
+# 配置项说明：
+#   working_dir: 工作目录，打包上传到 Ray 集群
+#   excludes: 排除不需要上传的目录（如 .git）
+#   env_vars: 环境变量设置
+#     TORCH_NCCL_AVOID_RECORD_STREAMS: 禁用 NCCL stream 记录，减少显存碎片
+#     VLLM_USE_V1: 启用 vLLM v1 版本推理引擎
+# =============================================================================
+working_dir: ./
+excludes: ["/.git/"]
+env_vars:
+  TORCH_NCCL_AVOID_RECORD_STREAMS: "1"
+  VLLM_USE_V1: "1"

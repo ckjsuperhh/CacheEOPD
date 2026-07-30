@@ -1,0 +1,16 @@
+# =============================================================================
+# dependabot.yml - 依赖自动更新配置
+# =============================================================================
+# 本文件启用 Dependabot 自动检查和更新项目依赖。
+# Dependabot 会定期扫描依赖项，并在有新版本可用时自动创建 PR。
+# 参考：https://docs.github.com/en/code-security/dependabot
+
+## 启用 Dependabot 检查项目依赖
+## Dependabot 会自动创建 PR 来更新过时的依赖
+
+version: 2  # Dependabot 配置文件 v2 格式
+updates:
+  - package-ecosystem: pip   # 使用 pip 作为包管理器（Python 项目）
+    directory: "/"           # 扫描项目根目录的 requirements 文件
+    schedule:
+      interval: weekly       # 每周检查一次依赖更新

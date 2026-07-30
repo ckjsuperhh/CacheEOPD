@@ -1,0 +1,41 @@
+# =============================================================================
+# DAPO 训练器配置文件（Megatron 版本）
+#
+# 用途：与 dapo_trainer.yaml 类似，但使用 Megatron-LM 作为分布式并行策略，
+#       继承自 verl 框架的 ppo_megatron_trainer 基础配置。
+#
+# 与 dapo_trainer.yaml 的区别：
+#   - defaults 中使用 ppo_megatron_trainer 替代 ppo_trainer
+#   - Megatron 策略支持张量并行（TP）、流水线并行（PP）和序列并行（SP），
+#     适用于更大规模模型的训练场景
+#
+# 其余 DAPO 特有配置（overlong_buffer、filter_groups 等）与 FSDP 版本相同。
+# =============================================================================
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_megatron_trainer
+  - _self_
+
+data:
+  gen_batch_size: ${data.train_batch_size}
+
+reward_model:
+  reward_manager: dapo
+  overlong_buffer: 
+    enable: False # We try to avoid forgetting to set enable
+    len: 0
+    penalty_factor: 0.0
+    log: False
+
+algorithm:
+  filter_groups:
+    _target_: verl.trainer.config.FilterGroupsConfig
+    enable: False # We try to avoid forgetting to set enable
+    metric: null # acc / score / seq_reward / seq_final_reward / ...
+    max_num_gen_batches: 0 # Non-positive values mean no upper limit
+
+trainer:
+  project_name: verl-dapo

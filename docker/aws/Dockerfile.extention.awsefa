@@ -1,0 +1,76 @@
+# ============================================================================
+# Docker 镜像: verl + AWS EFA (弹性网络适配器) 扩展
+# ============================================================================
+# 用途: 为 verl 镜像添加 AWS EFA 网络支持，适用于 SageMaker AI Pod 实例
+# 基础镜像: verlai/verl:app-verl0.6-transformers4.56.1-sglang0.5.2-mcore0.13.0-te2.2
+# 主要安装内容:
+#   - AWS EFA 驱动 (v1.40.0)
+#   - NCCL EFA 插件 (aws-ofi-nccl v1.14.2)
+#   - NCCL 2.25.1 (GPU 通信库)
+#   - OpenMPI 环境配置
+# 使用方式:
+#   docker run --ipc=host --privileged --gpus all --network=host ...
+# ============================================================================
+
+# 基于 verl 应用镜像，扩展 AWS EFA 网络支持
+# Base Image support aws EFA
+# Build Image with frameworks based on this
+FROM verlai/verl:app-verl0.6-transformers4.56.1-sglang0.5.2-mcore0.13.0-te2.2
+
+# 设置 EFA 相关环境变量
+# For aws instances with EFA net interface (Sagemaker AI Pod)
+#     install EFA driver:
+######## AWS EFA ############
+ENV NCCL_VERSION=2.25.1-1
+ENV DEBIAN_FRONTEND=noninteractive
+ENV EFA_INSTALLER_VERSION=1.40.0
+ENV AWS_OFI_NCCL_VERSION=1.14.2
+ENV FI_EFA_SET_CUDA_SYNC_MEMOPS=0
+ENV FI_PROVIDER=efa
+
+# 安装 Linux 内核镜像和 hwloc 硬件拓扑库（EFA 驱动依赖）
+RUN apt update && apt install -y linux-image-generic libhwloc-dev
+
+# 下载并安装 AWS EFA 驱动 (v1.40.0)
+RUN cd /tmp && \
+    curl -O https://efa-installer.amazonaws.com/aws-efa-installer-${EFA_INSTALLER_VERSION}.tar.gz  && \
+    tar -xf aws-efa-installer-${EFA_INSTALLER_VERSION}.tar.gz && \
+    cd aws-efa-installer && \
+    ./efa_installer.sh -y -g --skip-kmod --skip-limit-conf --no-verify && \
+    ldconfig && \
+    rm -rf /tmp/aws-efa-installer /var/lib/apt/lists/*
+
+# 编译安装 NCCL EFA 插件 (aws-ofi-nccl)，使 NCCL 能通过 EFA 网络通信
+# NCCL EFA Plugin
+RUN cd /tmp && \
+    curl -LO https://github.com/aws/aws-ofi-nccl/archive/refs/tags/v${AWS_OFI_NCCL_VERSION}.tar.gz && \
+    tar -xzf /tmp/v${AWS_OFI_NCCL_VERSION}.tar.gz && \
+    rm /tmp/v${AWS_OFI_NCCL_VERSION}.tar.gz && \
+    mv aws-ofi-nccl-${AWS_OFI_NCCL_VERSION} aws-ofi-nccl && \
+    cd /tmp/aws-ofi-nccl && \
+    ./autogen.sh && \
+    ./configure --prefix=/opt/amazon/efa \
+    --with-libfabric=/opt/amazon/efa \
+    --with-cuda=/usr/local/cuda \
+    --enable-platform-aws \
+    --with-mpi=/opt/amazon/openmpi && \
+    make -j$(nproc) install && \
+    rm -rf /tmp/aws-ofi/nccl
+
+# 配置动态链接库路径，确保 EFA 和 OpenMPI 库能被正确加载
+# NCCL
+RUN echo "/usr/local/lib"      >> /etc/ld.so.conf.d/local.conf && \
+    echo "/opt/amazon/openmpi/lib" >> /etc/ld.so.conf.d/efa.conf && \
+    ldconfig
+
+# 配置 OpenMPI 和 NCCL 环境变量：禁用不需要的传输层、设置网络接口过滤
+ENV OMPI_MCA_pml=^cm,ucx            \
+    OMPI_MCA_btl=tcp,self           \
+    OMPI_MCA_btl_tcp_if_exclude=lo,docker0,veth_def_agent \
+    OPAL_PREFIX=/opt/amazon/openmpi \
+    NCCL_SOCKET_IFNAME=^docker,lo,veth_def_agent  \
+    FI_EFA_USE_HUGE_PAGE=0
+
+# docker build -t verl:awsefa --label "commit=$(git rev-parse --short HEAD)" .
+# on aws:
+# docker run --ipc=host --privileged --name verldev --gpus all --network=host --shm-size=1800gb -itd verl:awsefa

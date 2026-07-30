@@ -1,0 +1,10 @@
+# CollabLLM Agent Loop 配置文件
+#
+# 该文件定义了 CollabLLM 使用的智能体循环（Agent Loop）类型。
+# 在 verl 框架的 rollout 阶段，智能体循环负责管理模型推理和多轮交互流程。
+#
+# - name: 智能体名称标识，与数据集中的 agent_name 字段匹配
+# - _target_: 指向具体的 AgentLoop 类的完整 Python 路径
+
+- name: collabllm_agent
+  _target_: recipe.collabllm.collabllm_agent_loop.CollabLLMAgentLoop

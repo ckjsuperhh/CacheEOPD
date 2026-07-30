@@ -1,0 +1,51 @@
+# ============================================================
+# FlowRL 训练器配置文件
+# 基于 Flow Balance 匹配奖励分布的强化学习训练配置，
+# 扩展自 PPO 训练器，使用 DAPO 奖励管理器。
+# ============================================================
+# FlowRL 训练器配置文件
+#
+# 该文件定义了 FlowRL 算法的训练配置，基于 Hydra 配置系统继承自 ppo_trainer 默认配置。
+#
+# 关键配置项：
+# - data.gen_batch_size: 生成批次大小（等于训练批次大小）
+# - reward_model.reward_manager: 使用 DAPO 奖励管理器
+# - reward_model.overlong_buffer: 过长回复缓冲配置
+# - algorithm.filter_groups: 过滤组配置（用于筛选高质量样本）
+#
+# 与其他 recipe 的区别：
+# FlowRL 使用流平衡原理匹配奖励分布，算法配置中可设置 tb_coef（轨迹平衡系数 β）
+
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+data:
+  gen_batch_size: ${data.train_batch_size}
+
+reward_model:
+  reward_manager: dapo
+  overlong_buffer:
+    enable: False # We try to avoid forgetting to set enable
+    len: 0
+    penalty_factor: 0.0
+    log: False
+
+algorithm:
+  # _target_: verl.trainer.config.AlgoConfig
+
+  # # FlowRL trajectory balance coefficient (β)
+  # tb_coef: 15.0
+
+  filter_groups:
+    _target_: verl.trainer.config.FilterGroupsConfig
+    enable: False # We try to avoid forgetting to set enable
+    metric: null # acc / score / seq_reward / seq_final_reward / ...
+    max_num_gen_batches: 0 # Non-positive values mean no upper limit
+
+trainer:
+  project_name: verl-flowrl

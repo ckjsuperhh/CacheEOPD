@@ -1,0 +1,64 @@
+# =============================================================================
+# .pre-commit-config.yaml - Git 提交前自动检查钩子配置
+# =============================================================================
+# 本文件定义了代码提交前自动运行的检查钩子（hooks）。
+# 使用方式：
+#   pip install pre-commit
+#   pre-commit install
+# 之后每次 git commit 都会自动运行以下检查。
+
+repos:
+  # ----- Ruff 代码检查与格式化 -----
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: "v0.12.2"
+    hooks:
+      - id: ruff
+        args: ["--fix", "--show-fixes", "--output-format=full"]  # 自动修复问题并显示详情
+        exclude: ^.*\.(ipynb)$  # 排除 Jupyter notebook 文件
+      - id: ruff-format  # Ruff 代码格式化器
+
+  # ----- mypy 静态类型检查 -----
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: 'v1.17.0'
+    hooks:
+      - id: mypy  # 对关键模块进行类型检查（配置见 pyproject.toml）
+
+  # ----- 自动生成训练器配置文件 -----
+  - repo: local
+    hooks:
+      - id: autogen-trainer-cfg
+        name: Generate and verify verl/trainer/config/_generated_*.yaml
+        # 自动从 Python 配置类生成 YAML 配置文件，确保两者一致
+        entry: scripts/generate_trainer_config.sh
+        language: script
+        pass_filenames: false
+
+  # ----- 检查 Python 文档字符串覆盖率 -----
+  - repo: local
+    hooks:
+      - id: check-docstrings
+        name: Check doc string coverage
+        # 检查代码中函数/类的 docstring 是否完整
+        entry: python3 tests/special_sanity/check_docstrings.py
+        language: python
+        pass_filenames: false
+
+  # ----- 检查开源许可证头部 -----
+  - repo: local
+    hooks:
+      - id: check-license
+        name: Check license
+        # 检查所有源码文件是否包含 Apache 2.0 许可证声明
+        entry: python3 tests/special_sanity/check_license.py --directories examples recipe scripts tests verl setup.py
+        language: python
+        pass_filenames: false
+
+  # ----- 编译检查所有 Python 文件 -----
+  - repo: local
+    hooks:
+      - id: compileall
+        name: Compile all python files
+        # 预编译全部 .py 文件，检测语法错误（以 error 模式运行，警告也会报错）
+        entry: sh -c 'PYTHONWARNINGS=error python3 -m compileall -q .'
+        language: python
+        pass_filenames: false

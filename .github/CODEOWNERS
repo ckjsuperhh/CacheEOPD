@@ -1,0 +1,44 @@
+# =============================================================================
+# CODEOWNERS - 代码所有者配置文件
+# =============================================================================
+# 本文件定义了各个目录/文件的代码审查负责人（Code Owners）。
+# 当 PR 修改以下路径的文件时，GitHub 会自动请求对应的 Code Owner 进行审查。
+# 格式：<路径> <@用户名1> <@用户名2> ...
+# =============================================================================
+
+# --- 文档目录 ---
+/docs @eric-haibin-lin @zhaochenyang20 @hongpeng-guo           # 文档总目录
+/docs/amd_tutorial @yushengsu-thu                              # AMD GPU 教程
+/docs/slang_multiturn @zhaochenyang20 @SwordFaith              # SGLang 多轮对话文档
+/docs/ascend_tutorial @FightingZhen                            # 华为昇腾 NPU 教程
+
+# --- Recipe（训练配方）目录 ---
+/recipe/dapo @tongyx361 @PeterSH6 @vermouth1992 @tardis-key @FightingZhen @ji-huazhong  # DAPO 算法 recipe
+/recipe/spin @zhaochenyang20                                   # SPIN 算法 recipe
+/recipe/sppo @zhaochenyang20                                   # SPPO 算法 recipe
+
+# --- 第三方推理引擎集成 ---
+/third_party/sglang @zhaochenyang20 @SwordFaith                # SGLang 推理引擎集成
+/third_party/vllm @PeterSH6 @wuxibin89                         # vLLM 推理引擎集成
+
+# --- Examples（示例代码）目录 ---
+/examples/grpo_trainer @vermouth1992 @PeterSH6 @tardis-key @FightingZhen @ji-huazhong  # GRPO 训练器示例
+
+# --- verl 核心代码目录 ---
+/verl/single_controller @zw0610 @wuxibin89 @hongpeng-guo       # 单控制器模块（Ray Worker 管理）
+/verl/trainer @eric-haibin-lin @vermouth1992 @tongyx361 @PeterSH6  # 训练器模块（PPO/DAPO 等）
+/verl/models/mcore @ISEEKYAN @vermouth1992                     # Megatron-Core 模型实现
+/verl/models/transformers @vermouth1992 @PeterSH6 @tardis-key @FightingZhen @ji-huazhong  # Transformers 模型实现
+/verl/workers/engine @eric-haibin-lin @vermouth1992 @ZihengJiang  # 推理引擎 Worker
+/verl/workers/roles @eric-haibin-lin @vermouth1992 @ZihengJiang   # 角色 Worker（Actor/Critic/Reward/Ref）
+/verl/workers/engine/fsdp @eric-haibin-lin @vermouth1992 @ZihengJiang  # FSDP 分布式引擎
+/verl/workers/rollout/vllm_rollout @wuxibin89 @PeterSH6 @chenhaiq     # vLLM Rollout Worker
+/verl/workers/rollout/sglang_rollout @zhaochenyang20 @SwordFaith @chenhaiq  # SGLang Rollout Worker
+/verl/workers/actor/megatron_actor.py @ISEEKYAN @vermouth1992  # Megatron Actor Worker
+/verl/workers/critic/megatron_critic.py @ISEEKYAN @vermouth1992  # Megatron Critic Worker
+/verl/workers/megatron_workers.py @ISEEKYAN @vermouth1992      # Megatron Workers 总入口
+
+# --- Tests（测试）目录 ---
+/tests/single_controller @zw0610 @wuxibin89                    # 单控制器测试
+/tests/trainer @eric-haibin-lin @vermouth1992 @tongyx361 @PeterSH6  # 训练器测试
+/tests/workers/rollout/vllm_rollout @wuxibin89 @PeterSH6 @chenhaiq  # vLLM Rollout 测试

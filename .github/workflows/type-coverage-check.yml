@@ -1,0 +1,38 @@
+# =============================================================================
+# CI Workflow: 类型注解和文档字符串覆盖率检查
+# 用途: 检查代码中类型注解和文档字符串（docstring）的覆盖率是否达标
+# 触发条件: 任何 PR 中 .py 文件或本 workflow 文件有变更时触发
+# =============================================================================
+
+name: Type Annotation and Docstring Coverage
+
+on:
+  pull_request:
+    paths:
+      - '**/*.py'
+      - '.github/workflows/type-coverage-check.yml'
+
+jobs:
+# 检查类型注解和文档字符串的覆盖率
+  type-coverage-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 🚨 Important: fetch full history so `origin/main` is available
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip3 install -r requirements.txt
+          pip3 install --no-deps -e .
+      - name: Run type annotation coverage check
+        run: |
+          python3 tests/special_sanity/type_coverage_check.py
+      - name: Run docstring coverage check
+        run: |
+          python3 tests/special_sanity/check_api_docs.py verl

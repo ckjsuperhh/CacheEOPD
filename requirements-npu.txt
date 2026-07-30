@@ -1,0 +1,27 @@
+# =============================================================================
+# requirements-npu.txt - 华为昇腾 NPU (Ascend) 环境专用依赖列表
+# =============================================================================
+# 本文件记录了在华为 Ascend NPU 环境下运行 EOPD/verl 所需的全部依赖。
+# NPU = Neural Processing Unit，华为自研的 AI 加速芯片。
+# 安装方式：pip install -r requirements-npu.txt
+
+accelerate           # HuggingFace 分布式训练加速库
+codetiming           # 代码执行计时工具
+datasets             # HuggingFace 数据集加载库
+dill                 # Python 对象序列化增强库
+hydra-core           # 配置管理框架，管理训练超参数
+numpy<2.0.0          # 数值计算库（限制版本以保持兼容性）
+pandas               # 数据处理与分析库
+peft>=0.15.2         # 参数高效微调库（NPU 环境要求更高版本）
+pyarrow>=15.0.0      # Parquet 文件读写库
+pybind11             # C++/Python 互操作绑定
+pylatexenc           # LaTeX 编解码工具
+tensordict>=0.8.0,<=0.10.0,!=0.9.0  # 张量字典数据结构
+ray[default]         # Ray 分布式计算框架
+wandb                # 实验追踪平台
+mathruler            # 数学推理评测工具
+torchdata            # PyTorch 数据加载工具
+einops               # 张量操作库（Einstein notation 简化张量变换）
+qwen_vl_utils        # Qwen-VL 多模态模型的工具库
+hf_transfer          # HuggingFace Hub 高速文件传输工具
+triton-ascend==3.2.0rc4  # Triton 编译器昇腾后端（NPU 专用的算子编译优化）

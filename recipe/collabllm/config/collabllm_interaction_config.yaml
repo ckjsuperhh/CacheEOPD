@@ -1,0 +1,29 @@
+# CollabLLM 交互配置文件
+#
+# 该文件定义了 CollabLLM 训练中的用户模拟器交互（User Simulator Interaction）。
+# 在多轮对话 rollout 过程中，verl 框架会使用该配置实例化交互对象，
+# 模拟用户与策略模型进行对话，从而生成用于强化学习的多轮对话数据。
+#
+# 关键配置项：
+# - name: 交互名称标识，在 agent loop 中通过该名称查找对应的交互实例
+# - class_name: 交互类的完整 Python 路径
+# - config.user_model: 用于模拟用户的 LLM 模型（如 gpt-4o-mini）
+# - config.num_retries: API 调用失败时的最大重试次数
+# - config.max_tokens: 用户模型每次回复的最大 token 数
+# - config.temperature: 用户模型的采样温度，较高值使回复更多样
+# - config.enable_log: 是否打印交互过程中的日志
+#
+# 与其他 recipe 的区别：
+# 该交互是 CollabLLM 特有的，它通过外部 LLM 模拟用户角色，
+# 而非使用固定规则或人工输入。
+
+interaction:
+  - name: "collabllm"
+    class_name: "recipe.collabllm.collabllm_interation.CollabLLMInteraction"
+    config: {
+      "user_model": "gpt-4o-mini",
+      "num_retries": 3,
+      "max_tokens": 512,
+      "temperature": 1.0,
+      "enable_log": True
+    }

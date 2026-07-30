@@ -1,0 +1,28 @@
+# ============================================================
+# TransferQueue PPO 训练器配置文件（FSDP 后端）
+# ============================================================
+# 用途：配置基于 TransferQueue 的 PPO 训练流程
+# 关键配置项：
+#   - hydra.searchpath: 指定 verl 默认配置搜索路径
+#   - defaults: 继承标准 ppo_trainer 配置，然后用本文件覆盖
+#   - transfer_queue.enable: 是否启用 TransferQueue 数据管道
+#   - transfer_queue.num_global_batch: 全局批次数（控制数据预取深度）
+#   - transfer_queue.storage_backend: 存储后端类型（AsyncSimpleStorageManager 为异步简单存储）
+#   - transfer_queue.num_data_storage_units: 数据存储单元数量（影响并行度）
+# 与其他 recipe 的区别：本配置引入了 TransferQueue 数据管理系统，
+# 实现高效的异步流式数据传递，适用于大规模分布式训练场景。
+# ============================================================
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+# config for TransferQueue
+transfer_queue:
+  enable: True
+  num_global_batch: 1
+  storage_backend: AsyncSimpleStorageManager
+  num_data_storage_units: 8

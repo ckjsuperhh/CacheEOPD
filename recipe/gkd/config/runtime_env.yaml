@@ -1,0 +1,34 @@
+# ==============================================================================
+# GKD 训练 Ray 运行时环境配置
+# ==============================================================================
+# 用途：为 Ray job 提交设置运行时环境变量，包括：
+#   - NCCL 通信配置（避免记录流、调试级别等）
+#   - NVTE（NVIDIA Transformer Engine）配置（Flash Attention 开关等）
+#   - vLLM V1 引擎启用
+#   - Ray 调试模式
+# 这些环境变量会影响所有 Ray worker 进程的行为。
+# ==============================================================================
+
+working_dir: ./
+excludes: ["/.git/"]
+env_vars:
+  TORCH_NCCL_AVOID_RECORD_STREAMS: "1"
+  CUDA_LAUNCH_BLOCKING: "0"
+  NVTE_DEBUG: "1"
+  NVTE_DEBUG_LEVEL: "2"
+  NVTE_FLASH_ATTN: "1" 
+  NVTE_FUSED_ATTN: "0" 
+  NVTE_UNFUSED_ATTN: "0" 
+  RAY_DEBUG: "legacy"
+  NCCL_DEBUG: "WARN"
+  # NCCL_IB_DISABLE: "1"
+  # NCCL_P2P_DISABLE: "1"
+  NCCL_DEBUG_FILE: "/workspace/nccl_debug.log"
+  # NCCL_SOCKET_IFNAME: "xgbe0"
+  VLLM_USE_V1: "1"
+  VERL_VLLM_DISTRIBUTED_BACKEND: "ray"
+
+
+  # NVTE_UNFUSED_ATTN: "1"
+  # If you are using vllm<=0.6.3, you might need to set the following environment variable to avoid bugs:
+  # VLLM_ATTENTION_BACKEND: "XFORMERS"

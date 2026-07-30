@@ -1,0 +1,26 @@
+# =============================================================================
+# .readthedocs.yaml - Read the Docs 在线文档构建配置
+# =============================================================================
+# 本文件配置 Read the Docs (RTD) 平台如何构建 verl 的在线文档。
+# 文档地址：https://verl.readthedocs.io/
+# 参考：https://docs.readthedocs.io/en/stable/config-file/v2.html
+
+version: 2  # 使用 RTD 配置文件 v2 格式
+
+# 构建环境配置
+build:
+  os: ubuntu-22.04        # 使用 Ubuntu 22.04 作为构建系统
+  tools:
+    python: "3.11"        # Python 3.11 运行环境
+    rust: "1.70"          # Rust 1.70（某些 Python 包的编译依赖）
+
+# Sphinx 文档生成器配置
+sphinx:
+  configuration: docs/conf.py  # Sphinx 配置文件路径
+
+# Python 包安装配置
+python:
+  install:
+    - requirements: docs/requirements-docs.txt  # 安装文档构建专用依赖
+    - method: pip
+      path: .                                    # 以 pip 方式安装 verl 包本身

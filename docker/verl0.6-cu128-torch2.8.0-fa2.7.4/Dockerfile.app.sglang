@@ -1,0 +1,13 @@
+# ============================================================================
+# Docker 应用镜像: verl 0.6 + SGLang 0.5.2
+# ============================================================================
+# 基础镜像: verlai/verl:base-verl0.6-cu128-cudnn9.8-torch2.8.0-fa2.7.4
+# 主要安装: SGLang 0.5.2 (推理引擎)、torch-memory-saver 0.0.9rc1
+# ============================================================================
+
+FROM verlai/verl:base-verl0.6-cu128-cudnn9.8-torch2.8.0-fa2.7.4
+
+# 安装 SGLang 0.5.2 推理引擎（含全部功能）
+RUN pip install --no-cache-dir "sglang[all]==0.5.2"
+# 安装 torch-memory-saver (显存管理)
+RUN pip install --no-cache-dir "torch-memory-saver==0.0.9rc1"

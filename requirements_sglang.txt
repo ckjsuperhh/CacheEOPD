@@ -1,0 +1,27 @@
+# =============================================================================
+# requirements_sglang.txt - SGLang 推理引擎环境的完整依赖列表
+# =============================================================================
+# 本文件记录了使用 SGLang 作为推理引擎时的全部依赖。
+# SGLang 是 vLLM 的替代推理引擎选项，在某些场景下性能更优。
+# 安装方式：pip install -r requirements_sglang.txt
+
+accelerate           # HuggingFace 分布式训练加速库
+codetiming           # 代码执行计时工具
+datasets             # HuggingFace 数据集加载库
+dill                 # Python 对象序列化增强库
+flash-attn           # Flash Attention GPU 高效注意力内核
+hydra-core           # 配置管理框架
+numpy<2.0.0          # 数值计算库（限制版本）
+pandas               # 数据处理与分析库
+peft                 # 参数高效微调库
+pyarrow>=19.0.0      # Parquet 文件读写库
+pybind11             # C++/Python 互操作绑定
+pylatexenc           # LaTeX 编解码工具
+ray[default]>=2.10   # Ray 分布式计算框架（要求 >=2.10）
+tensordict>=0.8.0,<=0.10.0,!=0.9.0  # 张量字典数据结构
+torchdata            # PyTorch 数据加载工具
+torchvision          # PyTorch 计算机视觉库（多模态模型需要）
+transformers         # HuggingFace Transformers 模型库
+wandb                # 实验追踪平台
+sglang[all]==0.5.2   # SGLang 推理引擎（安装全部组件），版本固定为 0.5.2
+huggingface_hub      # HuggingFace Hub 客户端，用于模型下载和上传
