@@ -24,4 +24,4 @@ torchdata            # PyTorch 数据加载工具
 einops               # 张量操作库（Einstein notation 简化张量变换）
 qwen_vl_utils        # Qwen-VL 多模态模型的工具库
 hf_transfer          # HuggingFace Hub 高速文件传输工具
-triton-ascend==3.2.0rc4  # Triton 编译器昇腾后端（NPU 专用的算子编译优化）
+triton-ascend==3.2.0  # Triton 编译器昇腾后端（NPU 专用的算子编译优化）
