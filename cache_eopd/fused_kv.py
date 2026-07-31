@@ -20,7 +20,7 @@ import torch
 from torch import nn
 from transformers import DynamicCache
 
-from rosetta.model.projector import C2CProjector, Projector
+from rosetta.model.projector import C2CProjector, Projector, load_projector, save_projector
 
 
 def build_layer_mapping(num_teacher_layers: int, num_student_layers: int) -> dict[int, int]:
@@ -200,6 +200,112 @@ class FusedKVBuilder(nn.Module):
             "teacher_logits": t_out.logits if self.config.return_teacher_logits else None,
         }
         return fused_cache, extras
+
+
+    # ------------------------------------------------------------------
+    # 训练版：对 projector 可微的 fused 前缀 cache
+    # ------------------------------------------------------------------
+    def build_trainable(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_ids: Optional[torch.Tensor],
+        prefix_len: int,
+    ) -> tuple[DynamicCache, torch.Tensor]:
+        """【C2C 核心】预训练 projector 时用的可微 fused 构造。
+
+        与 rollout 用的 build() 不同：这里只让 *projector* 处于 autograd 图中，
+        teacher/student 全程 no_grad（冻结），其 KV 当作常量 detach。反传路径为：
+            loss → student_response_logits → fused_prefix_KV → projector
+        这样反向传播只会更新 projector 的参数，符合『冻结 teacher/student，只训 projector』。
+
+        Args:
+            input_ids      : (B, T) 整段序列（含 prefix 与后续 response）
+            attention_mask : (B, T)
+            position_ids   : (B, T) 或 None
+            prefix_len     : 前缀长度 P；fused cache 只覆盖 x_0..x_{P-1}，
+                             后续 response（x_P..x_{T-2}）在训练循环里用 fused 前缀做 teacher-forcing
+        Returns:
+            fused_cache   : DynamicCache，长度 P，对 projector 可微
+            teacher_logits: (B, T, V) teacher 对整段序列的 logits（detach），
+                            训练循环截取 [:, P:T-1] 作为 response 位置的蒸馏目标
+        """
+        t_device = next(self.teacher.parameters()).device
+        s_device = next(self.student.parameters()).device
+        proj_param = next(self.projector.parameters())
+        pdtype, pdevice = proj_param.dtype, proj_param.device
+
+        # (a)【C2C 核心】teacher 整段前向（取 logits 目标 + 全 cache，稍后裁到前缀），no_grad
+        self.teacher.eval()
+        with torch.no_grad():
+            t_out = self.teacher(
+                input_ids=input_ids.to(t_device),
+                attention_mask=attention_mask.to(t_device),
+                position_ids=position_ids.to(t_device) if position_ids is not None else None,
+                use_cache=True,
+                past_key_values=DynamicCache(),
+            )
+        teacher_cache = t_out.past_key_values
+        teacher_logits = t_out.logits.detach().to(s_device)
+
+        # (b) student 前缀前向（只取前缀 KV），no_grad
+        self.student.eval()
+        with torch.no_grad():
+            s_out = self.student(
+                input_ids=input_ids[:, :prefix_len].to(s_device),
+                attention_mask=attention_mask[:, :prefix_len].to(s_device),
+                position_ids=position_ids[:, :prefix_len].to(s_device) if position_ids is not None else None,
+                use_cache=True,
+                past_key_values=DynamicCache(),
+            )
+        student_cache = s_out.past_key_values
+
+        # (c)【C2C 核心】逐层投影融合 —— 只有 projector 在 autograd 图中
+        fused_cache = DynamicCache()
+        for s_layer, t_layer in self.layer_mapping.items():
+            t_key, t_value = _get_layer_kv(teacher_cache, t_layer)
+            s_key, s_value = _get_layer_kv(student_cache, s_layer)
+            # 裁到前缀长度 P，再搬到 projector 所在卡；teacher/student 冻结 → detach 当常量
+            t_key = t_key[:, :, :prefix_len, :].contiguous().to(device=pdevice, dtype=pdtype).detach()
+            t_value = t_value[:, :, :prefix_len, :].contiguous().to(device=pdevice, dtype=pdtype).detach()
+            s_key = s_key.to(device=pdevice, dtype=pdtype).detach()
+            s_value = s_value.to(device=pdevice, dtype=pdtype).detach()
+            fused_key, fused_value = self.projector((t_key, t_value), (s_key, s_value))
+            fused_cache.update(fused_key.to(s_key.dtype), fused_value.to(s_value.dtype), s_layer)
+
+        return fused_cache, teacher_logits
+
+    # ------------------------------------------------------------------
+    # 工具：冻结 teacher/student，仅 projector 可训
+    # ------------------------------------------------------------------
+    def freeze_teacher_student(self) -> None:
+        """冻结 teacher 与 student（不更新权重），projector 保持可训。"""
+        for p in self.teacher.parameters():
+            p.requires_grad_(False)
+        for p in self.student.parameters():
+            p.requires_grad_(False)
+        self.teacher.eval()
+        self.student.eval()
+
+
+def save_projector_ckpt(projector: Projector, path: str) -> None:
+    """保存 projector 的「构造参数 + 权重」。
+
+    【坑】rosetta 的 save_projector/load_projector 只序列化 __init__ 参数（JSON），
+    完全不保存 state_dict —— load 出来的是按原参数重新构造的新实例。若训练时用了
+    zero_init=True，加载回来就是个全零 projector，训练成果静默丢失。
+    这里额外存权重，并用 load_projector_ckpt 配套加载。
+    """
+    save_projector(projector, path)  # 写 JSON 构造配置
+    torch.save(projector.state_dict(), path + ".weights")
+
+
+def load_projector_ckpt(path: str) -> Projector:
+    """与 save_projector_ckpt 配套：先按配置构造，再灌入训练好的权重。"""
+    projector = load_projector(path)
+    state = torch.load(path + ".weights", map_location="cpu")
+    projector.load_state_dict(state)
+    return projector
 
 
 def _get_layer_kv(cache, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:

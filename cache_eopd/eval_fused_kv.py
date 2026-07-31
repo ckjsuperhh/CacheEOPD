@@ -29,6 +29,7 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
 from cache_eopd.fused_kv import FusedKVBuilder, FusedKVConfig, _get_layer_kv
+from cache_eopd.fused_kv import load_projector_ckpt
 
 PROMPTS = [
     "What is 17 * 23? Think step by step.",
@@ -46,15 +47,21 @@ def parse_args():
     p.add_argument("--teacher-device", default=None)
     p.add_argument("--dtype", default="bfloat16")
     p.add_argument("--out", default=None, help="把指标写成 JSON 的路径")
+    p.add_argument("--projector-path", default=None,
+                   help="若提供，额外评估一个『预训练后』的 projector（验收 KL-to-teacher 是否下降）")
     return p.parse_args()
 
 
-def load(path, dtype, device):
+def load(path, dtype, device, exclude_gpus=None):
     if device == "auto":
+        max_memory = None
+        if exclude_gpus:
+            max_memory = {i: ("1MiB" if i in exclude_gpus else "7GiB") for i in range(6)}
         return AutoModelForCausalLM.from_pretrained(
-            path, dtype=dtype, attn_implementation="eager", device_map="auto").eval()
+            path, torch_dtype=dtype, attn_implementation="eager",
+            device_map="auto", max_memory=max_memory).eval()
     return AutoModelForCausalLM.from_pretrained(
-        path, dtype=dtype, attn_implementation="eager").to(device).eval()
+        path, torch_dtype=dtype, attn_implementation="eager").to(device).eval()
 
 
 @torch.no_grad()
@@ -89,7 +96,12 @@ def main():
     tok = AutoTokenizer.from_pretrained(args.student)
     tok.padding_side = "left"
     student = load(args.student, dtype, args.device)
-    teacher = load(args.teacher, dtype, args.teacher_device or args.device)
+    # teacher 用 auto 分片时，避开 VLLM 卡(0) 与 student 卡，避免显存打架
+    student_gpu = 0
+    if args.device.startswith("cuda:"):
+        student_gpu = int(args.device.split(":")[1])
+    exclude = {0, student_gpu} if args.teacher_device == "auto" else None
+    teacher = load(args.teacher, dtype, args.teacher_device or args.device, exclude_gpus=exclude)
 
     texts = [tok.apply_chat_template([{"role": "user", "content": q}],
                                      tokenize=False, add_generation_prompt=True) for q in PROMPTS]
@@ -110,9 +122,20 @@ def main():
                        position_ids=position_ids.to(t_dev)).logits[:, -1, :].float().to(args.device)
 
     metrics = {}
-    for tag, zero_init in [("zero_init", True), ("random_init", False)]:
-        builder = FusedKVBuilder.from_models(
-            teacher, student, FusedKVConfig(dtype=dtype, zero_init=zero_init))
+
+    # 构造待评估的 projector 集合：zero_init / random_init / (可选) 预训练后
+    builders = {}
+    builders["zero_init"] = FusedKVBuilder.from_models(
+        teacher, student, FusedKVConfig(dtype=dtype, zero_init=True))
+    builders["random_init"] = FusedKVBuilder.from_models(
+        teacher, student, FusedKVConfig(dtype=dtype, zero_init=False))
+    if args.projector_path:
+        trained = load_projector_ckpt(args.projector_path)
+        builders["pretrained"] = FusedKVBuilder.from_models(
+            teacher, student, FusedKVConfig(dtype=dtype, zero_init=False),
+            projector=trained)
+
+    for tag, builder in builders.items():
         fused_cache, _ = builder.build(input_ids, attention_mask, position_ids)
 
         # 指标 1: 每层 KV 的相对 L2 偏移
@@ -160,6 +183,17 @@ def main():
     r = metrics["random_init"]
     print(f"  random_init KV 相对偏移 key={r['kv_rel_l2_key_mean']:.4f} "
           f"value={r['kv_rel_l2_value_mean']:.4f} (>0 说明融合确实生效)")
+    if "pretrained" in metrics:
+        pr = metrics["pretrained"]
+        prk = pr["kl_to_teacher"]
+        print(f"  [验收] pretrained KV 相对偏移 key={pr['kv_rel_l2_key_mean']:.4f} "
+              f"value={pr['kv_rel_l2_value_mean']:.4f}")
+        if prk is not None:
+            arrow = "↓ 改善" if prk["improved"] else "↑ 未改善"
+            print(f"  [验收] pretrained KL→teacher: before={prk['before']:.4f} "
+                  f"after={prk['after']:.4f} {arrow}")
+        else:
+            print("  [验收] pretrained: 词表不一致，跳过 KL→teacher（需同 tokenizer）")
 
     if args.out:
         with open(args.out, "w") as f:
