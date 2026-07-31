@@ -71,6 +71,11 @@ class FusedKVConfig:
     # 【C2C 对齐 2】末位 token 不融合，由 decode 首步用 student 自身 KV 重算
     #（evaluate.py:839-840 的 instruction_index / response_index 划分）
     keep_last_token_unfused: bool = True
+    # 【阶段六】融合强度系数。projector 输出 = student + gate*w*proj(teacher)，
+    # 这里再对「增量」乘一个 scale：fused = student + fusion_scale * (proj_out - student)。
+    # scale=1.0 与原版完全等价；<1 削弱融合，>1 加强。用于「只保留纠偏效益、别把对的带歪」：
+    # 在评测侧直接扫不同 scale 即可（无需重训），找让 step200 增益最大、代价最小的取值。
+    fusion_scale: float = 1.0
 
 
 class FusedKVBuilder(nn.Module):
@@ -275,14 +280,18 @@ class FusedKVBuilder(nn.Module):
             s_key, s_value = _get_layer_kv(student_cache, s_layer)   # (B, Hs, L, Ds_head)
             # teacher 可能在另一张卡上（显存分离部署），先搬到 projector/student 所在卡
             # C2CProjector.forward 约定输入 (B, H, N, D)（内部自行展平/转置）
-            fused_key, fused_value = self.projector_for(s_layer)(
+            s_key_f = s_key[:, :, :fuse_len, :].to(device=proj_device, dtype=proj_dtype)
+            s_val_f = s_value[:, :, :fuse_len, :].to(device=proj_device, dtype=proj_dtype)
+            raw_key, raw_val = self.projector_for(s_layer)(
                 (t_key[:, :, :fuse_len, :].to(device=proj_device, dtype=proj_dtype),
                  t_value[:, :, :fuse_len, :].to(device=proj_device, dtype=proj_dtype)),
-                (s_key[:, :, :fuse_len, :].to(device=proj_device, dtype=proj_dtype),
-                 s_value[:, :, :fuse_len, :].to(device=proj_device, dtype=proj_dtype)),
+                (s_key_f, s_val_f),
             )
-            fused_key = fused_key.to(dtype=s_key.dtype, device=s_key.device)
-            fused_value = fused_value.to(dtype=s_value.dtype, device=s_value.device)
+            # 【阶段六】fused = student + fusion_scale * (proj_out - student)，
+            # proj_out 本身已含 student，故 (proj_out - student) 就是「投影增量」。
+            scale = self.config.fusion_scale
+            fused_key = (s_key_f + scale * (raw_key - s_key_f)).to(dtype=s_key.dtype, device=s_key.device)
+            fused_value = (s_val_f + scale * (raw_val - s_val_f)).to(dtype=s_value.dtype, device=s_value.device)
             if fuse_len < L:
                 # 末位拼回 student 自身的 KV，保持 cache 长度仍为 L
                 fused_key = torch.cat([fused_key, s_key[:, :, fuse_len:, :]], dim=2)
@@ -356,6 +365,10 @@ class FusedKVBuilder(nn.Module):
         teacher_logits = t_out.logits.detach().to(s_device) if need_teacher_logits else None
 
         # (b) student 前缀前向（只取前缀 KV），no_grad
+        # 【坑】这里会临时把 student 拨到 eval()；若调用方处于 train()（如
+        # train_student_distill 训学生时），必须还原，否则后续 response 前向
+        # 在 eval 下跑（dropout 关闭），与训练态不一致。
+        was_training = self.student.training
         self.student.eval()
         with torch.no_grad():
             s_out = self.student(
@@ -365,6 +378,8 @@ class FusedKVBuilder(nn.Module):
                 use_cache=True,
                 past_key_values=DynamicCache(),
             )
+        if was_training:
+            self.student.train()
         student_cache = s_out.past_key_values
 
         # (c)【C2C 核心】逐层投影融合 —— 只有 projector 在 autograd 图中
@@ -381,9 +396,11 @@ class FusedKVBuilder(nn.Module):
             t_value = t_value[:, :, :fuse_len, :].contiguous().to(device=pdevice, dtype=pdtype).detach()
             s_key = s_key_full[:, :, :fuse_len, :].contiguous().to(device=pdevice, dtype=pdtype).detach()
             s_value = s_value_full[:, :, :fuse_len, :].contiguous().to(device=pdevice, dtype=pdtype).detach()
-            fused_key, fused_value = self.projector_for(s_layer)((t_key, t_value), (s_key, s_value))
-            fused_key = fused_key.to(dtype=s_key_full.dtype, device=s_key_full.device)
-            fused_value = fused_value.to(dtype=s_value_full.dtype, device=s_value_full.device)
+            raw_key, raw_val = self.projector_for(s_layer)((t_key, t_value), (s_key, s_value))
+            # 【阶段六】fused = student + fusion_scale * (proj_out - student)
+            scale = self.config.fusion_scale
+            fused_key = (s_key + scale * (raw_key - s_key)).to(dtype=s_key_full.dtype, device=s_key_full.device)
+            fused_value = (s_value + scale * (raw_val - s_value)).to(dtype=s_value_full.dtype, device=s_value_full.device)
             fused_cache.update(fused_key, fused_value, s_layer)
 
         return fused_cache, teacher_logits
