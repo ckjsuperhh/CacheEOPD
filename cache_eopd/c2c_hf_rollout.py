@@ -27,7 +27,12 @@ from verl.utils.device import get_device_name, get_torch_device
 from verl.utils.torch_functional import get_response_mask
 from verl.workers.rollout.hf_rollout import HFRollout
 
-from cache_eopd.fused_kv import FusedKVBuilder, FusedKVConfig, _get_layer_kv
+from cache_eopd.fused_kv import (
+    FusedKVBuilder,
+    FusedKVConfig,
+    _get_layer_kv,
+    load_projector_ckpt,
+)
 
 __all__ = ["C2CHFRollout"]
 
@@ -95,11 +100,14 @@ class C2CHFRollout(HFRollout):
     def _get_builder(self, student_module: nn.Module) -> FusedKVBuilder:
         """惰性构造 FusedKVBuilder（需要 student config，且 FSDP 下要在 summon 上下文内）。"""
         if self._builder is None:
-            self._builder = FusedKVBuilder.from_models(self.teacher_module, student_module, self._fkv_cfg)
+            projectors = None
             if self._projector_path:
-                state = torch.load(self._projector_path, map_location="cpu")
-                self._builder.projector.load_state_dict(state)
-                self._builder.projector.to(next(student_module.parameters()).device)
+                # train_projector.py 存的是 per-layer 的 ModuleList（28 个 projector），
+                # 结构必须由 ckpt 决定而不是 config，否则形状对不上会静默走随机权重。
+                projectors = load_projector_ckpt(self._projector_path)
+            self._builder = FusedKVBuilder.from_models(
+                self.teacher_module, student_module, self._fkv_cfg, projector=projectors)
+            self._builder.projectors.eval()  # 硬门控，与验收口径一致
         return self._builder
 
     # ------------------------------------------------------------------

@@ -14,7 +14,11 @@ CacheEOPD/
     ├── c2c_hf_rollout.py      # C2CHFRollout：HFRollout + fused KV 注入
     ├── prototype_generate.py  # 最小原型：三路生成对比（不依赖 verl）
     ├── smoke_test_rollout.py  # C2CHFRollout 冒烟测试（不依赖 ray/FSDP）
-    └── eval_fused_kv.py       # 量化评测：KV 偏移 / 分布 KL / 教师对齐
+    ├── eval_fused_kv.py       # 量化评测：KV 偏移 / 分布 KL / 教师对齐
+    ├── train_projector.py     # projector 预训练（冻结 teacher/student）
+    ├── eval_projector_kl.py   # 验收：response 全位置 per-token KL
+    ├── eval_math_acc.py       # 下游验收：GSM8K 数学正确率
+    └── PROGRESS.md            # 过程记录：改动 / 实验 / 结果 / 踩坑
 ```
 
 对 EOPD 的改动只有 `verl/workers/fsdp_workers.py` 两处（新增 rollout 后端 `c2c_hf`），
@@ -59,9 +63,23 @@ zero_init 三项全为恒等 → 融合公式与层映射实现正确；random_i
 > 注 1：projector 随机初始化时生成质量会退化，这是预期的——投影器需要训练。
 > `zero_init=True` 提供了「初始等价于纯 EOPD、训练中逐步引入融合」的安全起点。
 >
-> 注 2：`kl_to_teacher` 指标当前区分度不足（基线仅 1.4e-4）。原因是它只看 prompt
-> 末位一个 token，而该位置 teacher/student 都几乎确定输出 `<think>`，分布近乎重合。
-> 训练 projector 后应改为在整段 response 上按位置平均，才能作为有效验收指标。
+> 注 2：`eval_fused_kv.py` 的 `kl_to_teacher` 区分度不足（基线仅 1.4e-4），因为它只看
+> prompt 末位一个 token，而该位置 teacher/student 都几乎确定输出 `<think>`，分布近乎重合。
+> 已由 `eval_projector_kl.py` 取代——在整段 response 上按 token 平均。
+
+## projector 预训练结果
+
+冻结 teacher/student 只训 `C2CProjector`，400 步后在 50 条 held-out 上：
+
+| 设置 | per-token KL(student ‖ teacher) |
+|---|---|
+| baseline（student 自身） | 0.4030 |
+| zero（融合恒等） | 0.4070 |
+| random（未训练） | 0.6888 |
+| **pretrained** | **0.1812（-55.0%）** |
+
+训练脚本 `train_projector.py`，验收 `eval_projector_kl.py`，下游正确率 `eval_math_acc.py`。
+完整实验过程与踩坑记录见 **[PROGRESS.md](PROGRESS.md)**。
 
 ## 复现
 
@@ -97,7 +115,8 @@ actor_rollout_ref:
 
 ## 待办
 
-- [ ] 训练 projector（当前随机初始化，融合信号无意义）
+- [x] 训练 projector —— held-out per-token KL 降 55%，见 [PROGRESS.md](PROGRESS.md)
+- [ ] 下游验收：GSM8K 数学正确率（`eval_math_acc.py`，进行中）
 - [ ] Part II：把 teacher logits（`FusedKVBuilder.build` 的 `extras`，
       需设 `return_teacher_logits=True`）接入 `core_algos.compute_policy_loss_on_policy_distill`
       的 token 重要性加权

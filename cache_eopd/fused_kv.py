@@ -7,10 +7,21 @@
     3. C2CProjector 把 teacher KV 逐层投影到 student 维度并融合 → fused KV-Cache
     4. 返回 fused cache（以及可选的 teacher logits，供 Part II token-importance 使用）
 
-参考实现：rosetta/model/wrapper.py 的 RosettaModel（Stage1 缓存 / Stage2 融合），
-但去掉了它的分段(instruction/section)控制流——EOPD rollout 里 prompt 是一整段，
-直接做一次前缀前向即可，无需 monkey-patch attention（融合发生在 generate 之前，
-fused cache 通过 past_key_values 传入，attention 自然使用它）。
+参考实现：rosetta/model/wrapper.py 的 RosettaModel（Stage1 缓存 / Stage2 融合）。
+无需 monkey-patch attention：融合发生在 generate 之前，fused cache 通过
+past_key_values 传入，attention 自然使用它。
+
+【与 C2C 原版对齐的三条约定】（第一轮训练因为违反它们导致 GSM8K 掉 6pp）：
+  1. **每个 student 层一个独立 projector**（C2C script/train/SFT_train.py:618
+     `num_projectors = slm_num_layers`，`projector_idx = target_layer_idx`）。
+     28 层共用一个 MLP 只能学到"所有层的平均妥协"——第 0 层和第 27 层的 KV
+     几何完全不同。
+  2. **只融合前 L-1 个 token**（C2C rosetta/utils/evaluate.py:839-840：
+     instruction_index 覆盖 L-1 个位置、response_index 是最后 1 个）。
+     最后一位由 decode loop 首步用 student 自己的 KV 重算。
+  3. **门控保持可学习**。C2C 的 key/value_gate_logit 是训练出来的，配合
+     per-layer projector 就是 28 组独立的层级开关，模型自己决定哪层该收
+     teacher 的信息。把它焊死成常开 = 无差别灌入，正是"把不该融合的融合了"。
 """
 
 from dataclasses import dataclass
@@ -44,8 +55,10 @@ def build_layer_mapping(num_teacher_layers: int, num_student_layers: int) -> dic
 class FusedKVConfig:
     """fused-KV 构造配置。字段与 C2CProjector 的关键超参对应。"""
 
-    projector_hidden_dim: int = 1024
-    projector_intermediate_dim: int = 1024
+    # 【C2C 对齐】per-layer projector 后总参数 = 28 × 单个，hidden 1024 会到 ~1.4G，
+    # 故默认降到 512（单个 ~13M ×28 ≈ 370M，bf16 约 0.7GB，可训）
+    projector_hidden_dim: int = 512
+    projector_intermediate_dim: int = 512
     projector_num_layers: int = 3
     projector_dropout: float = 0.0
     # 推理/验证阶段用 zero_init=False + 硬门控；训练 projector 时再打开 Gumbel 退火
@@ -53,6 +66,11 @@ class FusedKVConfig:
     dtype: torch.dtype = torch.bfloat16
     # 是否同时返回 teacher 对 prompt 的 logits（Part II token importance 需要）
     return_teacher_logits: bool = False
+    # 【C2C 对齐 1】每个 student 层一个独立 projector（SFT_train.py:618）
+    per_layer_projector: bool = True
+    # 【C2C 对齐 2】末位 token 不融合，由 decode 首步用 student 自身 KV 重算
+    #（evaluate.py:839-840 的 instruction_index / response_index 划分）
+    keep_last_token_unfused: bool = True
 
 
 class FusedKVBuilder(nn.Module):
@@ -73,7 +91,7 @@ class FusedKVBuilder(nn.Module):
         self,
         teacher: nn.Module,
         student: nn.Module,
-        projector: Projector,
+        projectors: nn.ModuleList,
         layer_mapping: dict[int, int],
         config: FusedKVConfig,
     ):
@@ -81,7 +99,8 @@ class FusedKVBuilder(nn.Module):
         # teacher/student 不注册为子模块（避免被 FSDP/optimizer 误纳入），只持引用
         object.__setattr__(self, "_teacher_ref", [teacher])
         object.__setattr__(self, "_student_ref", [student])
-        self.projector = projector
+        # 【C2C 对齐 1】per-layer 时长度 = student 层数；共享模式下长度为 1
+        self.projectors = projectors
         self.layer_mapping = layer_mapping
         self.config = config
 
@@ -93,6 +112,56 @@ class FusedKVBuilder(nn.Module):
     def student(self) -> nn.Module:
         return self._student_ref[0]
 
+    def projector_for(self, s_layer: int) -> Projector:
+        """取第 s_layer 层对应的 projector（共享模式下恒为第 0 个）。"""
+        return self.projectors[s_layer] if len(self.projectors) > 1 else self.projectors[0]
+
+    @property
+    def projector(self) -> Projector:
+        """兼容旧调用：取第 0 个。仅用于读超参/门控之类的全局操作。"""
+        return self.projectors[0]
+
+    def _proj_dtype_device(self) -> tuple[torch.dtype, torch.device]:
+        """取投影权重的 dtype/device。
+
+        【坑】不能用 next(self.projectors.parameters())：门控标量被单独提到 fp32 后，
+        参数遍历顺序不保证先命中投影权重，抓到 gate 就会把 KV 转成 fp32，撞上
+        "mat1 and mat2 must have the same dtype"。这里显式取投影输入层的权重。
+        """
+        w = self.projectors[0].key_in.weight
+        return w.dtype, w.device
+
+    def gate_params_to_fp32(self) -> None:
+        """把门控标量单独提到 fp32。
+
+        【坑】projector 整体是 bf16，而 gate_logit 是个**标量**：bf16 只有 8 位尾数，
+        1.0 附近的 ulp 是 2^-7 ≈ 0.0078。优化器每步给它的更新量在 1e-3 量级，
+        `param += update` 直接被舍入回原值 —— 实测 30 步后 logit 精确停在 1.0000，
+        看起来像"梯度为零"，其实是精度吞了更新，门控完全学不动。
+        这两个标量只参与 sigmoid((logit+noise)/T) 和 (logit>0)，与 KV 张量的 dtype
+        无关，提到 fp32 没有任何副作用。
+        """
+        for p in self.projectors:
+            p.key_gate_logit.data = p.key_gate_logit.data.float()
+            p.value_gate_logit.data = p.value_gate_logit.data.float()
+
+    def set_gate_logit(self, value: float) -> None:
+        """把所有 projector 的门控 logit 设为同一初值。
+
+        C2CProjector 默认 gate_logit=0 → 推理时硬门控 (0>0)=False → 融合被静默
+        全关。训练前设成正值（如 +1.0）保证一开始融合是打开的，之后由训练自己
+        决定要不要关掉某些层——注意与「fill_(3.0) 焊死不训」不同，这里只是初值。
+        """
+        with torch.no_grad():
+            for p in self.projectors:
+                p.key_gate_logit.fill_(value)
+                p.value_gate_logit.fill_(value)
+
+    def update_temperature(self, step: int) -> None:
+        """对所有 projector 同步 Gumbel 门控温度退火。"""
+        for p in self.projectors:
+            p.update_temperature(step)
+
     # ------------------------------------------------------------------
     # 构造
     # ------------------------------------------------------------------
@@ -102,9 +171,13 @@ class FusedKVBuilder(nn.Module):
         teacher: nn.Module,
         student: nn.Module,
         config: Optional[FusedKVConfig] = None,
-        projector: Optional[Projector] = None,
+        projector: Optional[nn.Module] = None,
     ) -> "FusedKVBuilder":
-        """从两个 HF 模型自动读取 KV 形状信息并构造 projector 与层映射。"""
+        """从两个 HF 模型自动读取 KV 形状信息并构造 projector 与层映射。
+
+        projector 可以是单个 Projector（共享模式）或 nn.ModuleList（per-layer，
+        由 load_projector_ckpt 返回）；为 None 时按 config.per_layer_projector 新建。
+        """
         config = config or FusedKVConfig()
         t_cfg, s_cfg = teacher.config, student.config
 
@@ -114,24 +187,34 @@ class FusedKVBuilder(nn.Module):
         t_head_dim = getattr(t_cfg, "head_dim", None) or t_cfg.hidden_size // t_cfg.num_attention_heads
         s_head_dim = getattr(s_cfg, "head_dim", None) or s_cfg.hidden_size // s_cfg.num_attention_heads
 
+        # 【C2C 对齐 1】per_layer=True 时每个 student 层各造一个 projector
+        n_proj = s_cfg.num_hidden_layers if config.per_layer_projector else 1
         if projector is None:
-            projector = C2CProjector(
-                source_dim=t_head_dim,
-                target_dim=s_head_dim,
-                source_num_heads=t_kv_heads,
-                target_num_heads=s_kv_heads,
-                hidden_dim=config.projector_hidden_dim,
-                intermediate_dim=config.projector_intermediate_dim,
-                num_layers=config.projector_num_layers,
-                dropout=config.projector_dropout,
-                dtype=config.dtype,
-                zero_init=config.zero_init,
-            )
+            projectors = nn.ModuleList([
+                C2CProjector(
+                    source_dim=t_head_dim,
+                    target_dim=s_head_dim,
+                    source_num_heads=t_kv_heads,
+                    target_num_heads=s_kv_heads,
+                    hidden_dim=config.projector_hidden_dim,
+                    intermediate_dim=config.projector_intermediate_dim,
+                    num_layers=config.projector_num_layers,
+                    dropout=config.projector_dropout,
+                    dtype=config.dtype,
+                    zero_init=config.zero_init,
+                )
+                for _ in range(n_proj)
+            ])
+        elif isinstance(projector, nn.ModuleList):
+            projectors = projector
+        else:
+            projectors = nn.ModuleList([projector])
+
         device = next(student.parameters()).device
-        projector = projector.to(device=device, dtype=config.dtype)
+        projectors = projectors.to(device=device, dtype=config.dtype)
 
         layer_mapping = build_layer_mapping(t_cfg.num_hidden_layers, s_cfg.num_hidden_layers)
-        return cls(teacher, student, projector, layer_mapping, config)
+        return cls(teacher, student, projectors, layer_mapping, config)
 
     # ------------------------------------------------------------------
     # 核心：构造 fused KV
@@ -152,6 +235,9 @@ class FusedKVBuilder(nn.Module):
         Returns:
             fused_cache : DynamicCache，student 维度，包含融合后的前缀 KV
             extras      : {"teacher_logits": (B, L, V_t) 或 None}
+
+        【C2C 对齐 2】默认只融合前 L-1 个位置，末位保留 student 自身 KV
+        （对应 evaluate.py:839-840 把最后 1 个 token 划给 response_index=-1）。
         """
         # ---- (a)【C2C 核心】teacher 前缀前向，取 sharer cache ----
         self.teacher.eval()
@@ -180,21 +266,28 @@ class FusedKVBuilder(nn.Module):
             self.student.train()
 
         # ---- (c)【C2C 核心】逐层投影融合: fused = student + gate * w * proj(teacher) ----
+        L = input_ids.size(1)
+        fuse_len = max(1, L - 1) if self.config.keep_last_token_unfused else L
         fused_cache = DynamicCache()
-        proj_param = next(self.projector.parameters())
-        proj_dtype, proj_device = proj_param.dtype, proj_param.device
+        proj_dtype, proj_device = self._proj_dtype_device()
         for s_layer, t_layer in self.layer_mapping.items():
             t_key, t_value = _get_layer_kv(teacher_cache, t_layer)   # (B, Ht, L, Dt_head)
             s_key, s_value = _get_layer_kv(student_cache, s_layer)   # (B, Hs, L, Ds_head)
             # teacher 可能在另一张卡上（显存分离部署），先搬到 projector/student 所在卡
             # C2CProjector.forward 约定输入 (B, H, N, D)（内部自行展平/转置）
-            fused_key, fused_value = self.projector(
-                (t_key.to(device=proj_device, dtype=proj_dtype),
-                 t_value.to(device=proj_device, dtype=proj_dtype)),
-                (s_key.to(device=proj_device, dtype=proj_dtype),
-                 s_value.to(device=proj_device, dtype=proj_dtype)),
+            fused_key, fused_value = self.projector_for(s_layer)(
+                (t_key[:, :, :fuse_len, :].to(device=proj_device, dtype=proj_dtype),
+                 t_value[:, :, :fuse_len, :].to(device=proj_device, dtype=proj_dtype)),
+                (s_key[:, :, :fuse_len, :].to(device=proj_device, dtype=proj_dtype),
+                 s_value[:, :, :fuse_len, :].to(device=proj_device, dtype=proj_dtype)),
             )
-            fused_cache.update(fused_key.to(s_key.dtype), fused_value.to(s_value.dtype), s_layer)
+            fused_key = fused_key.to(dtype=s_key.dtype, device=s_key.device)
+            fused_value = fused_value.to(dtype=s_value.dtype, device=s_value.device)
+            if fuse_len < L:
+                # 末位拼回 student 自身的 KV，保持 cache 长度仍为 L
+                fused_key = torch.cat([fused_key, s_key[:, :, fuse_len:, :]], dim=2)
+                fused_value = torch.cat([fused_value, s_value[:, :, fuse_len:, :]], dim=2)
+            fused_cache.update(fused_key, fused_value, s_layer)
 
         extras = {
             "teacher_logits": t_out.logits if self.config.return_teacher_logits else None,
@@ -211,7 +304,8 @@ class FusedKVBuilder(nn.Module):
         attention_mask: torch.Tensor,
         position_ids: Optional[torch.Tensor],
         prefix_len: int,
-    ) -> tuple[DynamicCache, torch.Tensor]:
+        need_teacher_logits: bool = True,
+    ) -> tuple[DynamicCache, Optional[torch.Tensor]]:
         """【C2C 核心】预训练 projector 时用的可微 fused 构造。
 
         与 rollout 用的 build() 不同：这里只让 *projector* 处于 autograd 图中，
@@ -225,28 +319,41 @@ class FusedKVBuilder(nn.Module):
             position_ids   : (B, T) 或 None
             prefix_len     : 前缀长度 P；fused cache 只覆盖 x_0..x_{P-1}，
                              后续 response（x_P..x_{T-2}）在训练循环里用 fused 前缀做 teacher-forcing
+            need_teacher_logits:
+                             True  = teacher 前向看整段（含 response），返回 logits 作蒸馏目标。
+                             False = teacher **只看前缀**，不返回 logits。
+                             【C2C 对齐】原版 sharer 只处理 instruction 段（kv_cache_index
+                             把 response 标成 -1 不缓存），SFT-CE 训练不需要 teacher logits，
+                             用 False 既省一半 teacher 算力，也避免 teacher KV 里混进
+                             它自己看过答案后的信息（那会造成信息泄漏）。
         Returns:
-            fused_cache   : DynamicCache，长度 P，对 projector 可微
-            teacher_logits: (B, T, V) teacher 对整段序列的 logits（detach），
-                            训练循环截取 [:, P:T-1] 作为 response 位置的蒸馏目标
+            fused_cache   : DynamicCache，对 projector 可微。
+                            **长度 = P-1**（keep_last_token_unfused=True 时）或 P。
+                            用 trainable_cache_len(P) 取这个长度。
+                            这里不像 build() 那样把末位 student KV 拼回来 —— 训练时
+                            调用方要把 x_{P-1} 当成 decode 首步喂进去，与 rollout
+                            的 crop_cache(cache, L-1) + 喂末位 token 完全同构。
+            teacher_logits: (B, T, V) teacher 对整段序列的 logits（detach）；
+                            need_teacher_logits=False 时为 None
         """
         t_device = next(self.teacher.parameters()).device
         s_device = next(self.student.parameters()).device
-        proj_param = next(self.projector.parameters())
-        pdtype, pdevice = proj_param.dtype, proj_param.device
+        pdtype, pdevice = self._proj_dtype_device()
 
-        # (a)【C2C 核心】teacher 整段前向（取 logits 目标 + 全 cache，稍后裁到前缀），no_grad
+        # (a)【C2C 核心】teacher 前向取 sharer cache，no_grad
+        # SFT 口径下只喂前缀，避免 teacher 提前看到答案（信息泄漏）
+        t_end = input_ids.size(1) if need_teacher_logits else prefix_len
         self.teacher.eval()
         with torch.no_grad():
             t_out = self.teacher(
-                input_ids=input_ids.to(t_device),
-                attention_mask=attention_mask.to(t_device),
-                position_ids=position_ids.to(t_device) if position_ids is not None else None,
+                input_ids=input_ids[:, :t_end].to(t_device),
+                attention_mask=attention_mask[:, :t_end].to(t_device),
+                position_ids=position_ids[:, :t_end].to(t_device) if position_ids is not None else None,
                 use_cache=True,
                 past_key_values=DynamicCache(),
             )
         teacher_cache = t_out.past_key_values
-        teacher_logits = t_out.logits.detach().to(s_device)
+        teacher_logits = t_out.logits.detach().to(s_device) if need_teacher_logits else None
 
         # (b) student 前缀前向（只取前缀 KV），no_grad
         self.student.eval()
@@ -261,19 +368,31 @@ class FusedKVBuilder(nn.Module):
         student_cache = s_out.past_key_values
 
         # (c)【C2C 核心】逐层投影融合 —— 只有 projector 在 autograd 图中
+        # 【C2C 对齐 2】与评测同口径：cache 只覆盖前 P-1 位，末位 x_{P-1} 交给调用方
+        # 当 decode 首步重新前向（rollout 里 crop_cache(cache, L-1) 就是这么做的）。
+        # 训练与推理的融合边界必须一致，否则学到的东西在 rollout 时错位一格。
+        fuse_len = self.trainable_cache_len(prefix_len)
         fused_cache = DynamicCache()
         for s_layer, t_layer in self.layer_mapping.items():
             t_key, t_value = _get_layer_kv(teacher_cache, t_layer)
-            s_key, s_value = _get_layer_kv(student_cache, s_layer)
-            # 裁到前缀长度 P，再搬到 projector 所在卡；teacher/student 冻结 → detach 当常量
-            t_key = t_key[:, :, :prefix_len, :].contiguous().to(device=pdevice, dtype=pdtype).detach()
-            t_value = t_value[:, :, :prefix_len, :].contiguous().to(device=pdevice, dtype=pdtype).detach()
-            s_key = s_key.to(device=pdevice, dtype=pdtype).detach()
-            s_value = s_value.to(device=pdevice, dtype=pdtype).detach()
-            fused_key, fused_value = self.projector((t_key, t_value), (s_key, s_value))
-            fused_cache.update(fused_key.to(s_key.dtype), fused_value.to(s_value.dtype), s_layer)
+            s_key_full, s_value_full = _get_layer_kv(student_cache, s_layer)
+            # 裁到融合长度，再搬到 projector 所在卡；teacher/student 冻结 → detach 当常量
+            t_key = t_key[:, :, :fuse_len, :].contiguous().to(device=pdevice, dtype=pdtype).detach()
+            t_value = t_value[:, :, :fuse_len, :].contiguous().to(device=pdevice, dtype=pdtype).detach()
+            s_key = s_key_full[:, :, :fuse_len, :].contiguous().to(device=pdevice, dtype=pdtype).detach()
+            s_value = s_value_full[:, :, :fuse_len, :].contiguous().to(device=pdevice, dtype=pdtype).detach()
+            fused_key, fused_value = self.projector_for(s_layer)((t_key, t_value), (s_key, s_value))
+            fused_key = fused_key.to(dtype=s_key_full.dtype, device=s_key_full.device)
+            fused_value = fused_value.to(dtype=s_value_full.dtype, device=s_value_full.device)
+            fused_cache.update(fused_key, fused_value, s_layer)
 
         return fused_cache, teacher_logits
+
+    def trainable_cache_len(self, prefix_len: int) -> int:
+        """build_trainable 返回的 cache 长度：P-1（末位不融合）或 P。"""
+        if self.config.keep_last_token_unfused:
+            return max(1, prefix_len - 1)
+        return prefix_len
 
     # ------------------------------------------------------------------
     # 工具：冻结 teacher/student，仅 projector 可训
@@ -288,24 +407,49 @@ class FusedKVBuilder(nn.Module):
         self.student.eval()
 
 
-def save_projector_ckpt(projector: Projector, path: str) -> None:
-    """保存 projector 的「构造参数 + 权重」。
+def save_projector_ckpt(projectors, path: str) -> None:
+    """保存 projector 的「构造参数 + 权重」，支持 per-layer 的 ModuleList。
 
     【坑】rosetta 的 save_projector/load_projector 只序列化 __init__ 参数（JSON），
     完全不保存 state_dict —— load 出来的是按原参数重新构造的新实例。若训练时用了
     zero_init=True，加载回来就是个全零 projector，训练成果静默丢失。
     这里额外存权重，并用 load_projector_ckpt 配套加载。
+
+    【C2C 对齐 1】28 个 per-layer projector 结构完全同构，构造配置只存一份（JSON），
+    权重按层顺序存成一个列表，加载时逐个复原。
     """
-    save_projector(projector, path)  # 写 JSON 构造配置
-    torch.save(projector.state_dict(), path + ".weights")
+    plist = list(projectors) if isinstance(projectors, nn.ModuleList) else [projectors]
+    save_projector(plist[0], path)  # 写 JSON 构造配置（各层同构，一份足够）
+    torch.save(
+        {
+            "num_projectors": len(plist),
+            "state_dicts": [
+                {k: v.detach().cpu() for k, v in p.state_dict().items()} for p in plist
+            ],
+        },
+        path + ".weights",
+    )
 
 
-def load_projector_ckpt(path: str) -> Projector:
-    """与 save_projector_ckpt 配套：先按配置构造，再灌入训练好的权重。"""
-    projector = load_projector(path)
-    state = torch.load(path + ".weights", map_location="cpu")
-    projector.load_state_dict(state)
-    return projector
+def load_projector_ckpt(path: str) -> nn.ModuleList:
+    """与 save_projector_ckpt 配套：先按 JSON 配置构造，再逐层灌入训练好的权重。
+
+    返回 nn.ModuleList（长度 = 训练时的 projector 数），可直接传给
+    FusedKVBuilder.from_models(..., projector=...)。旧格式（单个 state_dict）
+    也能加载，包成长度 1 的 ModuleList。
+    """
+    blob = torch.load(path + ".weights", map_location="cpu")
+    if not (isinstance(blob, dict) and "state_dicts" in blob):
+        # 旧格式：整个文件就是一个 state_dict
+        projector = load_projector(path)
+        projector.load_state_dict(blob)
+        return nn.ModuleList([projector])
+    mods = []
+    for state in blob["state_dicts"]:
+        p = load_projector(path)
+        p.load_state_dict(state)
+        mods.append(p)
+    return nn.ModuleList(mods)
 
 
 def _get_layer_kv(cache, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:

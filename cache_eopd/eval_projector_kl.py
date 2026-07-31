@@ -100,12 +100,13 @@ def main():
         cfg = FusedKVConfig(dtype=dtype, zero_init=zero,
                             projector_num_layers=args.projector_layers)
         b = FusedKVBuilder.from_models(teacher, student, cfg, projector=projector)
-        # 强制门控常开，使 zero/random/pretrained 仅在「投影权重」上不同，
-        # 否则 gate_logit=0 会让硬门控关掉融合，三者都退化成 student 自身。
-        b.projector.use_gumbel = False
-        with torch.no_grad():
-            b.projector.key_gate_logit.fill_(3.0)
-            b.projector.value_gate_logit.fill_(3.0)
+        # zero/random 两个对照组没训练过，gate_logit=0 会让硬门控关掉融合、
+        # 三者都退化成 student 自身，所以强制常开。pretrained 例外：它的门控是
+        # 训练出来的（哪层该融合是学到的结论），必须原样保留。
+        if projector is None:
+            for p in b.projectors:
+                p.use_gumbel = False
+            b.set_gate_logit(3.0)
         return b
 
     builders = {
@@ -120,7 +121,7 @@ def main():
     for b in builders.values():
         if b is not None:
             b.freeze_teacher_student()
-            b.projector.eval()  # 验收用硬门控，与 rollout 推理一致
+            b.projectors.eval()  # 验收用硬门控，与 rollout 推理一致
 
     tot = {k: 0.0 for k in builders}
     cnt = 0
