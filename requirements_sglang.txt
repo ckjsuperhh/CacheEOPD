@@ -11,7 +11,7 @@ datasets             # HuggingFace 数据集加载库
 dill                 # Python 对象序列化增强库
 flash-attn           # Flash Attention GPU 高效注意力内核
 hydra-core           # 配置管理框架
-numpy<2.0.0          # 数值计算库（限制版本）
+numpy<3.0.0          # 数值计算库（限制版本）
 pandas               # 数据处理与分析库
 peft                 # 参数高效微调库
 pyarrow>=19.0.0      # Parquet 文件读写库

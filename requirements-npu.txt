@@ -10,7 +10,7 @@ codetiming           # 代码执行计时工具
 datasets             # HuggingFace 数据集加载库
 dill                 # Python 对象序列化增强库
 hydra-core           # 配置管理框架，管理训练超参数
-numpy<2.0.0          # 数值计算库（限制版本以保持兼容性）
+numpy<3.0.0          # 数值计算库（限制版本以保持兼容性）
 pandas               # 数据处理与分析库
 peft>=0.15.2         # 参数高效微调库（NPU 环境要求更高版本）
 pyarrow>=15.0.0      # Parquet 文件读写库
