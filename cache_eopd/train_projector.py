@@ -52,6 +52,7 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from cache_eopd.fused_kv import FusedKVBuilder, FusedKVConfig, save_projector_ckpt
+from cache_eopd.train_student_distill import load_teacher_sharded
 
 
 def parse_args():
@@ -84,10 +85,12 @@ def parse_args():
     p.add_argument("--warmup-steps", type=int, default=30)
     p.add_argument("--anneal-steps", type=int, default=600,
                    help="Gumbel 门控温度退火总步数（C2C 默认 1360；设成与 steps 同量级）")
-    p.add_argument("--eval-every", type=int, default=100)
+    p.add_argument("--eval-every", type=int, default=20,
+                   help="每 N 步在 holdout 上记录一次 CE/acc（阶段六：改 20 以精细定位最优步数）")
     p.add_argument("--eval-samples", type=int, default=32)
     p.add_argument("--out-dir", default="./ckpt_projector_v6")
-    p.add_argument("--save-every", type=int, default=200)
+    p.add_argument("--save-every", type=int, default=20,
+                   help="每 N 步存一次 projector 权重（阶段六：改 20 以便按需挑选最优 checkpoint）")
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--projector-hidden", type=int, default=512)
     p.add_argument("--projector-inter", type=int, default=512)
@@ -112,6 +115,13 @@ def parse_args():
                    help="投影输出层零初始化：融合从恒等(=student 自身)出发，训练只能改善")
     p.add_argument("--no-zero-init", dest="zero_init", action="store_false")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--fusion-scale", type=float, default=1.0,
+                   help="融合强度系数：fused = student + scale*(proj_out - student)。"
+                        "1.0 与原版等价；<1 削弱融合以『只保留纠偏效益、别把对的带歪』。"
+                        "该系数在评测侧也可直接扫（无需重训）。")
+    p.add_argument("--layer-mapping", choices=["last_aligned", "k_nearest", "relative_depth"],
+                   default="relative_depth",
+                   help="teacher→student 层映射；旧 v6 checkpoint 使用 relative_depth")
     return p.parse_args()
 
 
@@ -170,6 +180,7 @@ def main():
     # ---- 模型 ----
     student_gpu = int(args.device.split(":")[1]) if args.device.startswith("cuda:") else 0
     teacher_max_memory = None
+    teacher_devices = None
     if args.teacher_device == "auto":
         n_gpu = torch.cuda.device_count()
         if args.teacher_gpus:
@@ -177,16 +188,21 @@ def main():
         else:
             # 默认排除 GPU0(VLLM) 与 student 卡
             allow = {i for i in range(n_gpu)} - {0, student_gpu}
+        teacher_devices = sorted(allow)
         teacher_max_memory = {
             i: (args.teacher_mem_per_gpu if i in allow else "1MiB") for i in range(n_gpu)
         }
-        print(f"[load] teacher 分片可用卡 = {sorted(allow)} "
+        print(f"[load] teacher 分片可用卡 = {teacher_devices} "
               f"(每卡上限 {args.teacher_mem_per_gpu})", flush=True)
     print(f"[load] student  <- {args.student} ({args.device})", flush=True)
     student = load_model(args.student, dtype, args.device, attn_impl=args.attn_impl)
     print(f"[load] teacher  <- {args.teacher} ({args.teacher_device})", flush=True)
-    teacher = load_model(args.teacher, dtype, args.teacher_device,
-                         max_memory=teacher_max_memory, attn_impl=args.attn_impl)
+    if args.teacher_device == "auto" and teacher_devices:
+        teacher = load_teacher_sharded(
+            args.teacher, dtype, teacher_devices, attn_impl=args.attn_impl)
+    else:
+        teacher = load_model(args.teacher, dtype, args.teacher_device,
+                             max_memory=teacher_max_memory, attn_impl=args.attn_impl)
     tok = AutoTokenizer.from_pretrained(args.student)
     if tok.pad_token_id is None:
         tok.pad_token = tok.eos_token
@@ -220,6 +236,8 @@ def main():
         zero_init=args.zero_init,
         per_layer_projector=args.per_layer,
         keep_last_token_unfused=True,   # 【C2C 对齐 2】与 eval 同口径
+        fusion_scale=args.fusion_scale,  # 【阶段六】融合强度系数（默认 1.0 等价原版）
+        layer_mapping_strategy=args.layer_mapping,
     )
     builder = FusedKVBuilder.from_models(teacher, student, cfg)
     builder.freeze_teacher_student()

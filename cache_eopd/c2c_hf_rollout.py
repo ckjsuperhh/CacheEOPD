@@ -78,6 +78,9 @@ class C2CHFRollout(HFRollout):
             fkv_cfg = FusedKVConfig(
                 dtype=torch.bfloat16,
                 zero_init=bool(c2c_cfg.get("zero_init", False)),
+                layer_mapping_strategy=c2c_cfg.get(
+                    "layer_mapping", c2c_cfg.get("mapping", "relative_depth")
+                ),
             )
             # module 可能是 FSDP 包装的；FusedKVBuilder 只在 summon_full_params 上下文内调用
             self._fkv_cfg = fkv_cfg

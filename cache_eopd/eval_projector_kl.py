@@ -48,6 +48,9 @@ def parse_args():
                         "确保验收样本训练时没见过")
     p.add_argument("--projector-layers", type=int, default=3)
     p.add_argument("--projector-path", default=None)
+    p.add_argument("--layer-mapping", choices=["last_aligned", "k_nearest", "relative_depth"],
+                   default="relative_depth",
+                   help="teacher→student 层映射；旧 projector checkpoint 使用 relative_depth")
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args()
 
@@ -97,8 +100,12 @@ def main():
 
     # ---- 构造各变体的 builder ----
     def make_builder(projector=None, zero=False):
-        cfg = FusedKVConfig(dtype=dtype, zero_init=zero,
-                            projector_num_layers=args.projector_layers)
+        cfg = FusedKVConfig(
+            dtype=dtype,
+            zero_init=zero,
+            projector_num_layers=args.projector_layers,
+            layer_mapping_strategy=args.layer_mapping,
+        )
         b = FusedKVBuilder.from_models(teacher, student, cfg, projector=projector)
         # zero/random 两个对照组没训练过，gate_logit=0 会让硬门控关掉融合、
         # 三者都退化成 student 自身，所以强制常开。pretrained 例外：它的门控是

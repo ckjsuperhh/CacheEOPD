@@ -49,6 +49,9 @@ def parse_args():
     p.add_argument("--out", default=None, help="把指标写成 JSON 的路径")
     p.add_argument("--projector-path", default=None,
                    help="若提供，额外评估一个『预训练后』的 projector（验收 KL-to-teacher 是否下降）")
+    p.add_argument("--layer-mapping", choices=["last_aligned", "k_nearest", "relative_depth"],
+                   default="relative_depth",
+                   help="teacher→student 层映射；旧 projector checkpoint 使用 relative_depth")
     return p.parse_args()
 
 
@@ -126,13 +129,19 @@ def main():
     # 构造待评估的 projector 集合：zero_init / random_init / (可选) 预训练后
     builders = {}
     builders["zero_init"] = FusedKVBuilder.from_models(
-        teacher, student, FusedKVConfig(dtype=dtype, zero_init=True))
+        teacher, student, FusedKVConfig(
+            dtype=dtype, zero_init=True,
+            layer_mapping_strategy=args.layer_mapping))
     builders["random_init"] = FusedKVBuilder.from_models(
-        teacher, student, FusedKVConfig(dtype=dtype, zero_init=False))
+        teacher, student, FusedKVConfig(
+            dtype=dtype, zero_init=False,
+            layer_mapping_strategy=args.layer_mapping))
     if args.projector_path:
         trained = load_projector_ckpt(args.projector_path)
         builders["pretrained"] = FusedKVBuilder.from_models(
-            teacher, student, FusedKVConfig(dtype=dtype, zero_init=False),
+            teacher, student, FusedKVConfig(
+                dtype=dtype, zero_init=False,
+                layer_mapping_strategy=args.layer_mapping),
             projector=trained)
 
     for tag, builder in builders.items():

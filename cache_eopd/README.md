@@ -37,8 +37,10 @@ prompt ──┬──▶ teacher forward ──▶ teacher KV (sharer)
         student 带 fused KV 自回归续写 ──▶ rollout response
 ```
 
-层映射（`build_layer_mapping`）按相对深度对齐，处理 teacher/student 层数不同的情况
-（如 Qwen3-4B 36 层 → Qwen3-1.7B 28 层）。
+层映射（`build_layer_mapping`）支持三种策略：`relative_depth`、`last_aligned` 和
+`k_nearest`。官方 C2C fuser 的 recipe 使用 `last_aligned`；例如 Qwen3-4B 的 36 层
+到 Qwen3-0.6B 的 28 层对应 teacher 第 8 到 35 层。旧 v6 projector 使用
+`relative_depth`，评测旧 checkpoint 时必须显式保留该策略。
 
 ## 已验证结论（apex-llm, 6×A6000）
 
@@ -79,7 +81,8 @@ zero_init 三项全为恒等 → 融合公式与层映射实现正确；random_i
 | **pretrained** | **0.1812（-55.0%）** |
 
 训练脚本 `train_projector.py`，验收 `eval_projector_kl.py`，下游正确率 `eval_math_acc.py`。
-完整实验过程与踩坑记录见 **[PROGRESS.md](PROGRESS.md)**。
+阶段性简报见 **[EXPERIMENT_SUMMARY.md](EXPERIMENT_SUMMARY.md)**；完整实验过程与踩坑记录见
+**[PROGRESS.md](PROGRESS.md)**。
 
 ## 复现
 
@@ -97,6 +100,12 @@ PYTHONPATH=. python -m cache_eopd.smoke_test_rollout \
 PYTHONPATH=. python -m cache_eopd.eval_fused_kv \
     --student <student_path> --teacher <teacher_path> \
     --device cuda:3 --teacher-device auto --out metrics.json
+
+# 4. 评估官方 C2C fuser；官方 recipe 的层映射必须使用 last_aligned
+PYTHONPATH=. python -m cache_eopd.eval_math_acc \
+    --student <student_path> --teacher <teacher_path> \
+    --fuser-dir <official_fuser>/final --layer-mapping last_aligned \
+    --device cuda:3 --teacher-device auto
 ```
 
 ## 在 EOPD 训练中启用
@@ -111,6 +120,7 @@ actor_rollout_ref:
       teacher_device: auto                 # 或 null（同卡）/ "cuda:N"
       projector_path: null                 # C2C 预训练 projector 权重；null 则随机初始化
       zero_init: false                     # true = 初始等价于纯 EOPD
+      layer_mapping: last_aligned          # 官方 C2C；旧 v6 checkpoint 改为 relative_depth
 ```
 
 ## 待办

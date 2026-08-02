@@ -38,6 +38,10 @@ from cache_eopd.fused_kv import (
     _get_layer_kv,
     load_projector_ckpt,
 )
+from cache_eopd.train_student_distill import (
+    load_official_fuser_projectors,
+    load_teacher_sharded,
+)
 
 
 def parse_args():
@@ -47,8 +51,15 @@ def parse_args():
     p.add_argument("--data-path", required=True)
     p.add_argument("--device", default="cuda:1")
     p.add_argument("--teacher-device", default="auto")
+    p.add_argument("--teacher-gpus", default=None,
+                   help="--teacher-device auto 时允许 teacher 占用的卡，逗号分隔（如 '4,5'）。"
+                        "不填则自动排除 GPU0(VLLM) 与 student 卡 —— 但那会把被别的作业"
+                        "占满的卡也算进来导致 OOM，卡紧张时务必显式指定。")
+    p.add_argument("--teacher-mem-per-gpu", default="7GiB")
     p.add_argument("--dtype", default="bfloat16")
     p.add_argument("--projector-path", default=None)
+    p.add_argument("--fuser-dir", default=None,
+                   help="官方 C2C fuser 的 final 目录（含 projector_{idx}.pt/.json）")
     p.add_argument("--num-samples", type=int, default=150)
     p.add_argument("--max-new-tokens", type=int, default=512)
     p.add_argument("--max-prompt-len", type=int, default=512)
@@ -58,6 +69,13 @@ def parse_args():
     p.add_argument("--sanity", type=int, default=3,
                    help="先用 N 条样本自检：zero 融合的生成必须与原生 generate 一致（0=跳过）")
     p.add_argument("--out", default=None, help="逐条结果写入 jsonl，便于事后人工核查")
+    p.add_argument("--fusion-scale", type=float, default=1.0,
+                   help="融合强度系数：fused = student + scale*(proj_out - student)。"
+                        "1.0 等价原版；<1 削弱融合、>1 加强。可在不重训的前提下直接扫，"
+                        "找『纠偏效益最大、把对的带歪最小』的取值。")
+    p.add_argument("--layer-mapping", choices=["last_aligned", "k_nearest", "relative_depth"],
+                   default="relative_depth",
+                   help="teacher→student 层映射；旧 projector checkpoint 使用 relative_depth")
     return p.parse_args()
 
 
@@ -175,11 +193,15 @@ def baseline_generate(student, input_ids, attention_mask, max_new_tokens, eos_id
 
 def main():
     args = parse_args()
+    if args.projector_path and args.fuser_dir:
+        raise ValueError("--projector-path 与 --fuser-dir 只能二选一")
     dtype = getattr(torch, args.dtype)
 
-    def load(path, device, exclude=None):
+    def load(path, device, allow=None):
         if device == "auto":
-            mm = {i: ("1MiB" if i in exclude else "7GiB") for i in range(6)} if exclude else None
+            n = torch.cuda.device_count()
+            mm = {i: (args.teacher_mem_per_gpu if i in allow else "1MiB")
+                  for i in range(n)} if allow else None
             return AutoModelForCausalLM.from_pretrained(
                 path, torch_dtype=dtype, attn_implementation="eager",
                 device_map="auto", max_memory=mm).eval()
@@ -188,8 +210,16 @@ def main():
 
     student = load(args.student, args.device)
     sg = int(args.device.split(":")[1]) if args.device.startswith("cuda:") else 0
-    teacher = load(args.teacher, args.teacher_device,
-                   {0, sg} if args.teacher_device == "auto" else None)
+    allow = None
+    if args.teacher_device == "auto":
+        allow = ({int(x) for x in args.teacher_gpus.split(",")} if args.teacher_gpus
+                 else set(range(torch.cuda.device_count())) - {0, sg})
+        print(f"[load] teacher 分片可用卡 = {sorted(allow)}", flush=True)
+    if args.teacher_device == "auto":
+        teacher_devices = sorted(allow or set())
+        teacher = load_teacher_sharded(args.teacher, dtype, teacher_devices, attn_impl="eager")
+    else:
+        teacher = load(args.teacher, args.teacher_device, allow)
     tok = AutoTokenizer.from_pretrained(args.student)
     if tok.pad_token_id is None:
         tok.pad_token = tok.eos_token
@@ -230,7 +260,12 @@ def main():
 
     # ---- builder ----
     def make_builder(projector=None, zero=False):
-        cfg = FusedKVConfig(dtype=dtype, zero_init=zero)
+        cfg = FusedKVConfig(
+            dtype=dtype,
+            zero_init=zero,
+            fusion_scale=args.fusion_scale,
+            layer_mapping_strategy=args.layer_mapping,
+        )
         b = FusedKVBuilder.from_models(teacher, student, cfg, projector=projector)
         b.freeze_teacher_student()
         b.projectors.eval()  # 硬门控，与 rollout 推理一致
@@ -302,6 +337,10 @@ def main():
     arms = {"baseline": None}
     if args.projector_path:
         arms["pretrained"] = make_builder(projector=load_projector_ckpt(args.projector_path))
+    elif args.fuser_dir:
+        arms["official_fuser"] = make_builder(
+            projector=load_official_fuser_projectors(args.fuser_dir, s_device)
+        )
 
     stats = {k: {"correct": 0, "total": 0, "no_answer": 0, "gen_len": 0} for k in arms}
     out_f = open(args.out, "w") if args.out else None
@@ -341,8 +380,9 @@ def main():
         print(f"  {k:12s} acc {v['correct']}/{v['total']} = {v['correct']/n:.1%}   "
               f"未抽到答案 {v['no_answer']}   平均生成长度 {v['gen_len']/n:.0f}")
 
-    if "pretrained" in stats:
-        b, p = stats["baseline"], stats["pretrained"]
+    experiment_arm = "pretrained" if "pretrained" in stats else "official_fuser"
+    if experiment_arm in stats:
+        b, p = stats["baseline"], stats[experiment_arm]
         n = max(1, b["total"])
         ba, pa = b["correct"] / n, p["correct"] / n
         print(f"\n[判据] pretrained - baseline = {(pa - ba) * 100:+.1f} 个百分点")

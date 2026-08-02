@@ -34,21 +34,54 @@ from transformers import DynamicCache
 from rosetta.model.projector import C2CProjector, Projector, load_projector, save_projector
 
 
-def build_layer_mapping(num_teacher_layers: int, num_student_layers: int) -> dict[int, int]:
+def build_layer_mapping(
+    num_teacher_layers: int,
+    num_student_layers: int,
+    strategy: str = "relative_depth",
+) -> dict[int, int]:
     """构造 student 层 → teacher 层的映射。
 
     【C2C 核心】teacher/student 层数不同时（如 Qwen3-4B 36 层 → Qwen3-1.7B 28 层），
     每个 student 层取 teacher 中相对深度最接近的层（与 C2C 论文的均匀映射一致）。
     层数相同时退化为恒等映射。
     """
-    if num_teacher_layers == num_student_layers:
-        return {i: i for i in range(num_student_layers)}
-    # 相对深度对齐: student 第 i 层 (深度 i/S) ← teacher 第 round(i/S * T) 层
-    mapping = {}
-    for i in range(num_student_layers):
-        j = round(i * (num_teacher_layers - 1) / max(num_student_layers - 1, 1))
-        mapping[i] = j
-    return mapping
+    if num_teacher_layers <= 0 or num_student_layers <= 0:
+        return {}
+
+    if strategy == "relative_depth":
+        return {
+            i: round(i * (num_teacher_layers - 1) / max(num_student_layers - 1, 1))
+            for i in range(num_student_layers)
+        }
+
+    if strategy == "last_aligned":
+        offset = num_teacher_layers - num_student_layers
+        return {
+            i: min(max(offset + i, 0), num_teacher_layers - 1)
+            for i in range(num_student_layers)
+        }
+
+    if strategy == "k_nearest":
+        student_positions = [
+            i / max(num_student_layers - 1, 1) for i in range(num_student_layers)
+        ]
+        teacher_positions = [
+            i / max(num_teacher_layers - 1, 1) for i in range(num_teacher_layers)
+        ]
+        return {
+            student_idx: min(
+                range(num_teacher_layers),
+                key=lambda teacher_idx: abs(
+                    teacher_positions[teacher_idx] - student_positions[student_idx]
+                ),
+            )
+            for student_idx in range(num_student_layers)
+        }
+
+    raise ValueError(
+        f"Unsupported layer mapping strategy: {strategy}. "
+        "Choose from relative_depth, last_aligned, k_nearest."
+    )
 
 
 @dataclass
@@ -66,6 +99,7 @@ class FusedKVConfig:
     dtype: torch.dtype = torch.bfloat16
     # 是否同时返回 teacher 对 prompt 的 logits（Part II token importance 需要）
     return_teacher_logits: bool = False
+    layer_mapping_strategy: str = "relative_depth"
     # 【C2C 对齐 1】每个 student 层一个独立 projector（SFT_train.py:618）
     per_layer_projector: bool = True
     # 【C2C 对齐 2】末位 token 不融合，由 decode 首步用 student 自身 KV 重算
@@ -218,7 +252,11 @@ class FusedKVBuilder(nn.Module):
         device = next(student.parameters()).device
         projectors = projectors.to(device=device, dtype=config.dtype)
 
-        layer_mapping = build_layer_mapping(t_cfg.num_hidden_layers, s_cfg.num_hidden_layers)
+        layer_mapping = build_layer_mapping(
+            t_cfg.num_hidden_layers,
+            s_cfg.num_hidden_layers,
+            config.layer_mapping_strategy,
+        )
         return cls(teacher, student, projectors, layer_mapping, config)
 
     # ------------------------------------------------------------------

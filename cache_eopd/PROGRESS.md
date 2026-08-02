@@ -627,3 +627,776 @@ v5 的 ckpt 已作废（训练口径错误，见阶段四）。
 - [ ] ③ **完整两版训练**（steps≈300、lr 1e-5、batch 8）—— 两臂必须**串行**（各占 4B+0.6B，
       并发会抢 GPU 5 的 4B 权重导致 OOM）
 - [ ] ④ `eval_math_acc.py` baseline 臂分别评两学生 plain 准确率，比 (fused 学生) vs (plain 学生)
+
+### 完整训练 OOM 排查与修复（2026-07-31 晚，apex-llm）
+
+极简冒烟过后，**完整 300 步 fused 训练在首个 backward 就 OOM**，而且现象很诡异：
+`GPU1 Tried to allocate 210 MiB / only 167 MiB free`，进程内 PyTorch 已用 **6.64 GiB**。
+无论 `--max-prompt-len/answer-len` 取 256 还是 384，报错数字**逐字节相同** → 说明不是
+序列长度（激活）问题，而是某个**固定开销**在作祟。这次 OOM 发生在 `grad_accum` 首轮
+backward，**优化器状态还没分配**，所以换 CPU-offload AdamW 也救不了它。
+
+**根因（排查过程，不是猜出来的）**：
+- 分阶段打点测量（`/tmp/diag_train.py`、`/tmp/diag_loop.py`）：
+  - 0.6B student + AdamW 固定占用 **1.11 GiB**（torch 2.6 AdamW 状态默认 bf16，很省）
+  - 28 个官方 projector（hidden=1024）搬上 GPU1 后 **+~1.0 GiB**（2.10 总计）
+  - 一个完整 fused step（build_trainable + decode fwd+bwd），跨 12 个样本（ans 170~385）
+    实测 GPU1 **峰值最高仅 4.01 GiB** → 理论上 7 GiB 预算绰绰有余。
+- 所以 6.64 的多出来 ~2.6 GiB 只可能来自 **teacher**。teacher 用 `device_map="auto"` +
+  `max_memory={2:"7GiB",3:"7GiB",其余"1MiB"}` 加载时，auto 规划器在单卡 7GiB 预算下过于
+  保守，把 4B 的 **5.4 GiB offload 到磁盘**（日志 `Some parameters are on the meta device...`），
+  只留 2.8 GiB 在 GPU2/3。`build_trainable` 前向时，被 offload 的层按**当前设备**
+  （torch 默认 = 学生所在的 cuda:1）加载 → 4B 权重临时压到 GPU1 → 6.64 OOM。
+- 这也解释了「256/256 与 384/384 报错完全一致」：OOM 的是被临时搬到 GPU1 的 teacher 权重，
+  跟学生序列长度无关。
+
+**修复迭代（共三版，全部落地进 `train_student_distill.py`，未提交）**：
+
+1. **teacher 显式 device_map 消除磁盘 offload**：`AutoConfig` 取层数后手写
+   `model.layers.{i}` 到 GPU2/3 的映射（embed_tokens/norm/lm_head 也显式指定），
+   4B 完整落进 GPU2+GPU3（各 4.11 GiB），**不再有 5.4 GiB 挂在磁盘**、teacher 前向
+   也不再临时把权重搬上 GPU1。
+   - **坑 1**：`lm_head` 必须与 `embed_tokens` 同卡（Qwen3 两者 tied），否则 accelerate 报
+     `Tied parameters are on different devices` 直接崩在 teacher forward。
+     第一版 lm_head 放 cuda:3 → 崩 → 改回 cuda:2 通过。
+   - **坑 2**：第一版把层**轮询**分到 2,3（layer0→cuda2, layer1→cuda3...），36 层 = 36 次
+     PCIe 跨卡 → teacher forward 极慢。改为**连续均分**（0-17→cuda2, 18-35→cuda3），
+     只 1 次跨卡边界。
+2. **CPU-offload AdamW 尝试（脚本内 `CPUAdamW` 类）**：m/v 存 CPU、step 时梯度搬 CPU
+   算完搬回。能跑、不 OOM，但**慢得离谱**：实测 ~45-50 s/step（22160% CPU），
+   300 步要 ~18h，不可接受 → 弃用（类保留在脚本里作注释参考）。
+3. **最终组合（当前在跑）**：**projector 搬到 GPU4**（新增 `--proj-device cuda:4`，
+   释放 GPU1 ~1 GiB）+ **GPU AdamW fused**（torch 2.6 支持 bf16）+ teacher 连续均分在
+   GPU2/3 + 学生 384/384 全长。
+   - GPU1 只剩 student(1.11) + 激活 + m/v(2.4) ≈ 峰值 5.7-6.8 GiB < 7.08 预算，**不 OOM**。
+   - 速度 ~3 s/micro-batch（≈9× 快于 CPUAdamW）。
+
+**验证**：最终组合 10 步 smoke（grad_accum=2, 384/384）**60 秒跑完全程**：
+`step5 CE 0.516 → step10 CE 0.402`、`holdout plain CE 0.253`、正常存档 `ckpt_smoke_fused3`，无 OOM。
+
+**当前 GPU 拓扑（apex，2026-07-31 晚）**：GPU0 被 vLLM 占满 48G；GPU1-5 各被 `knhdu` 占 ~41 GiB，
+单卡实际可用仅 **~7 GiB**。所以 student 固定放 cuda:1，teacher 放 cuda:2,3，串行跑两臂。
+
+**任务状态（实时，2026-08-01 00:5x）**：
+- [x] ① 资源就位（fuser + Qwen3-0.6B + 4B teacher 轨迹）
+- [x] ② 修 3 个管道 bug + OOM 根因（teacher 磁盘 offload）+ lm_head tied 坑 + CPUAdamW 太慢
+- [x] ③ **fused 完整训练 300 步完成**：CE 0.43→0.20，holdout plain CE 0.3075，`ckpt_student_fused`
+- [x] ④ **plain 完整训练 300 步完成**：CE 0.15–0.25，holdout plain CE 0.2103，`ckpt_student_plain`
+- [x] ⑤ **fused / plain 下游 300 题评测完成**（base 0.6B 参照仍在跑，~1h）
+      **坑**：`--student` 必须指向 ckpt **根目录**（训练脚本只有根目录存了 tokenizer；
+      `student_step300` 子目录只有模型，`AutoTokenizer` 会报 vocab_file=None）
+
+### 阶段七结果（300 题 GSM8K，baseline 臂 = 学生自身生成，2026-08-01）
+
+| 学生 | 训练方式 | plain 准确率 | 平均生成长度 |
+|---|---|---|---|
+| **plain 学生** | 学生自身前缀 SFT（w/o C2C） | **63.0%**（189/300） | 293 |
+| 原始 Qwen3-0.6B | 未训练（参照） | 61.3%（184/300） | 264 |
+| **fused 学生** | teacher KV 融合前缀训练（w/ C2C） | 60.3%（181/300） | 268 |
+
+**结论**：
+1. **C2C 融合训练未帮助、反而有害**：plain − fused = **+2.7pp**；fused 甚至**低于未训练 base −1.0pp**
+   （融合前缀 SFT 把学生教得比原版还差）。
+2. **普通 SFT 本身有效**（对照成立）：plain 比 base 高 **+1.7pp**，训练管道无信号问题。
+3. **适用范围**：仅此配置（300 步、lr 1e-5、grad_accum 8、官方 fuser、off-policy 教师轨迹 SFT）。
+   与真正要跑的 on-policy EOPD 蒸馏（w/ vs w/o C2C rollout）是不同实验，**不构成对蒸馏假设的否决**。
+   （过拟合诊断见下节：取 step50/100/200 早停点评测，证实 fused 随步数**特异过拟合**、且全点被 plain 压制，
+   主因 train/test 失配而非蒸馏无效。）
+
+**后续可选方向**：更长步数（~1-2k）/ 更小 lr / `--fusion-scale<1` 扫描；或直接做 2-phase EOPD 蒸馏的 w/ vs w/o C2C 对比。
+
+### 阶段七(过拟合诊断)：取更早 checkpoint 评测（2026-08-01，已完成）
+
+用户提出：融合 teacher KV 容易过拟合，要不要把 step100 / step200 的 fused 学生拿出来测，
+看是否比 step300(60.3%) 更好。
+
+**关键澄清**：阶段七的评测走 `eval_math_acc.py` 的 **baseline 臂**（不带 `--projector-path`），
+所以它测的是「该学生 checkpoint 自身的泛化能力」，与训练时是否融合 teacher KV 无关。
+因此：直接把 `student_step100` / `student_step200` 子目录当 `--student` 评即可，无需重做融合。
+
+**已做**：
+- 4 个 step 子目录（fused/plain × step100/step200）原本只有模型权重、无 tokenizer；
+  已从各自根目录复制 tokenizer 文件进去（否则 `AutoTokenizer` 报 vocab_file=None）。
+- 启动 `eval_early_ckpts.sh`（apex pid 1186224）：对上述 4 个 ckpt 各跑 300 题 standalone 评测，
+  复用阶段七卡分配（学生 cuda:1，teacher auto 于 GPU2,3 磁盘 offload），写各自 jsonl+log。
+- 后台 watcher 轮询 master log，4 个全跑完即通知。
+- **step50 改为并行加速**（用户更想先看 step50）：原 KoBu3l 排队脚本已取消，改为在 **GPU4/5**
+  起 `eval_step50_parallel.sh`（apex pid 1193743）与主链(GPU1)并行跑 `fused_step50`/`plain_step50`
+  各 300 题（student cuda:4，teacher 分片 4,5）。目的：step50 约 2h 内出数，而非原队列末尾的 ~5h。
+  `student_step50` tokenizer 已补。⚠️ GPU5 余量仅 ~0.9G（teacher 分片偏重），但 baseline 臂不前向
+  teacher，内存静态，应无 OOM；若炸则降 `--teacher-mem-per-gpu` 重试。
+
+**待收**：fused / plain 在 **step50 / step100 / step200 / step300(=60.3% / 63.0%)** 的对比
+→ 判过拟合是否成立（fused 早停点显著前移、且 plain 不明显 = fused 特异性过拟合；
+若 step50>step100>step200>step300 则最优点在 <50，需再补更早 ckpt）。
+
+**实时结果(进行中, 2026-08-01 ~12:30)**：
+
+| 学生 | step50 | step100 | step200 | step300(已知) |
+|---|---|---|---|---|
+| **fused** | **61.0%**（183/300） | **62.0%**（186/300） | **60.3%**（181/300） | 60.3%（181/300） |
+| **plain** | **62.3%**（187/300） | **63.0%**（189/300） | **62.7%**（188/300） | 63.0%（189/300） |
+
+→ fused 曲线 **step50(61.0%) → step100(62.0%,峰) → step200(60.3%) → step300(60.3%)**：
+**先欠拟合、step100 到顶、之后过拟合平台**。最优在 step100，**不是更早的 step50**。
+→ plain 曲线 **step50(62.3%) → step100(63.0%) → step200(62.7%) → step300(63.0%)**：微升后平台，**完全不退化**
+   （与 fused 的 step100→300 塌方成鲜明对照）。
+→ **过拟合是 fused 特异的**：每一 checkpoint fused 都低于 plain
+   （step50: 61.0 vs 62.3；step100: 62.0 vs 63.0；step300: 60.3 vs 63.0），
+   且 fused 随步数退化而 plain 不退化。用户原假说"融合 kv 容易过拟合"✅ 证实，确定为 fused-only。
+→ 但 fused 即便最优 step100(62.0) 仍 < plain 任意点(63.0)：说明 fused 跑不赢 plain **不只是过拟合**
+   （纯过拟合应有"早停点≈plain"），而是 **训练/测试失配（KV 拐杖考试不在）为主因 + 过拟合为辅**。
+→ **6 点全出（2026-08-01 14:22）**，过拟合诊断完成，结论见下。
+
+**最终结论（过拟合诊断）**：
+1. **融合 teacher KV 训练会随步数过拟合，且是 fused 特异的**：fused 在 step100(62.0%) 到顶后
+   退化至 step200/300(60.3%)；plain 全程平台（step50/100/200/300 = 62.3 / 63.0 / 62.7 / 63.0），
+   **不退化**。用户在阶段七初的直觉"融合 kv 容易过拟合"✅ 证实。
+2. **早停有效但救不回 fused**：取 fused 最优 step100(62.0%) 比 step300(60.3%) 高 +1.7pp，
+   但 step50(61.0%) 反而更低（欠拟合），故最优点是 **step100 而非更早**。
+3. **fused 全点被 plain 压制（62.0 峰 < 63.0）**：说明 fused 跑不赢 plain **不只是过拟合**
+   （纯过拟合早停点应≈plain），主因是 off-policy 评测下的 **train/test 失配**（训练塞了 KV 拐杖、
+   考试不给药）→ 失配为主 + 过拟合为辅。与阶段七原结论 3（on-policy EOPD 才公平）一致。
+
+> 经验：**跨卡/磁盘 offload 的模型在「当前设备」上临时落权重**是本次 OOM 的隐蔽来源。
+> apex 这种单卡仅 ~7 GiB 的环境，遇到 `device_map="auto"` 触发磁盘 offload 时要特别警惕；
+> 且 **CPU-offload 优化器在 apex 上慢 9 倍**，优先用「把附属模块挪到空闲卡」来换显存。
+
+---
+
+## 阶段八：对齐 C2C 官方层映射（进行中）
+
+### 触发原因
+
+阶段七加载的官方 fuser 配置确认使用 `mapping: last_aligned`，但本项目的
+`FusedKVBuilder` 默认使用相对深度映射。对于 teacher 36 层、student 28 层：
+
+```text
+官方 C2C last_aligned: student 0 → teacher 8，student 27 → teacher 35
+旧 Builder relative_depth: student 0 → teacher 0，student 27 → teacher 35
+```
+
+因此阶段七的官方 projector 很可能一直接收了错误层的 teacher KV；在修正前，不能把
+阶段七的 fused 训练结果作为 C2C 方法本身的结论。
+
+### 已完成的代码修正
+
+- `fused_kv.py` 的 `build_layer_mapping` 现在支持 `relative_depth`、`last_aligned`、
+  `k_nearest` 三种策略；当前 Builder 仍保持单个 student 层对应单个 teacher 层，
+  对齐 C2C 官方训练中的 `K=1` 设置。
+- `train_student_distill.py` 默认使用 `last_aligned`，因为它加载官方 fuser。
+- `train_projector.py`、`eval_math_acc.py`、`eval_projector_kl.py`、`eval_fused_kv.py`
+  均增加 `--layer-mapping`；旧 v6 projector 默认继续使用 `relative_depth`。
+- `c2c_hf_rollout.py` 支持 rollout 配置中的 `layer_mapping`/`mapping` 字段。
+- 本地纯 Python 映射验证通过：36→28 的 `last_aligned` 为 `0→8`、`27→35`；全部相关
+  文件语法编译通过。
+
+### 远端已有数据的补充观察
+
+远端已有的 step200、`fusion_scale=0.3` 评测尚未跑满 300 题，目前 290 题为：
+
+```text
+baseline 240/290，fused 238/290
+paired gain 16，loss 18
+```
+
+相较强融合时的破坏性有所减弱，但不能替代映射修正后的正式实验。
+
+### 下一步
+
+- [x] 将修正后的映射代码同步到 apex-llm，并保留远端旧版备份
+- [x] 完成原始 0.6B + 官方 fuser 的 5/20 题 relative_depth vs last_aligned 小样本对照
+- [x] `eval_math_acc.py` 支持直接加载官方 `projector_{idx}.pt/.json`
+- [x] 合并 apex 原有的显式 teacher 分片、独立 projector GPU 和 fused AdamW，避免阶段八同步
+      时丢失已有 OOM 修复
+- [ ] 完成 `fusion_scale=0.3` 的 300 题评测
+- [ ] 使用正确映射重新训练 fused student，并与 plain SFT 做同预算对比
+- [ ] 再进入带/不带 C2C 的端到端 EOPD 对照
+
+### 阶段八冒烟结果（apex-llm，2026-08-01）
+
+已将阶段八代码同步到 `/home/kejiechen/CacheEOPD`，旧文件备份在
+`cache_eopd/.mapping_backup_20260801`。使用官方
+`qwen3_0.6b+qwen3_4b_base_Fuser/final`，同一批 GSM8K 前 5 题、max-new-tokens=256：
+
+| 层映射 | baseline | official fuser | cache 自检 |
+|---|---:|---:|---|
+| `last_aligned` | 2/5 | 1/5 | B==C 1/1 ✅ |
+| `relative_depth` | 2/5 | 2/5 | B==C 1/1 ✅ |
+
+两种映射的生成长度和答案已经不同，说明层映射确实进入了实际推理路径；5 题结果不具备
+统计意义，不能据此判断哪种策略更好。运行时仍出现 teacher 部分磁盘 offload 提示，正式
+评测需要继续使用显式连续 GPU 分片，避免把性能问题混入 accuracy 结论。
+
+### 20 题正式小样本与弱融合结果
+
+合并显式连续分片后重新评测，运行时不再出现磁盘 offload：
+
+| 设置 | baseline | official fuser | paired gain | paired loss |
+|---|---:|---:|---:|---:|
+| `last_aligned`, scale=1.0 | 13/20 | 7/20 | 0 | 6 |
+| `last_aligned`, scale=0.3 | 13/20 | 11/20 | 0 | 2 |
+| `relative_depth`, scale=1.0 | 13/20 | 7/20 | 1 | 7 |
+
+`scale=0.3` 明显减少了破坏性，但暂未产生纠偏收益。`last_aligned` 与
+`relative_depth` 的生成长度和文本不同，说明映射确实影响实际路径；两种策略在 20 题上
+都明显低于 baseline，因此“映射错误”不是官方 fuser 负收益的唯一原因。以上样本仍只用于
+筛选方向，正式结论需要扩大到 300 题。
+
+### 阶段八正式评测登记（2026-08-01）
+
+启动 300 题官方 fuser 弱融合评测，配置固定为：
+
+- student/teacher：Qwen3-0.6B / Qwen3-4B base；官方 fuser final
+- layer mapping：`last_aligned`
+- fusion scale：`0.3`
+- dataset：`GSM8K-COT/gsm8k_cot_slime_300_seed41717.jsonl`
+- generation：`max_new_tokens=512`
+- teacher 显式分片：`cuda:2,3`；student：`cuda:1`；projector：`cuda:4`
+- output：`/home/kejiechen/CacheEOPD/logs/eval_official_fuser_last_aligned_scale03_300.jsonl`
+
+目标是确认 20 题上“弱融合减少破坏但没有 gain”的现象是否稳定，并记录 baseline/fuser
+准确率、paired gain/loss 及平均生成长度。评测结束后若仍无 paired gain，将转向使用 GSM8K
+teacher trajectory、正确 `last_aligned` 映射重新训练 projector，而不再把 OpenHermes 官方
+fuser 作为主要实验结论。
+
+### 正式评测第一次启动故障（2026-08-01）
+
+第一次启动已完成模型加载和 `B==C 3/3` cache 自检，但在第一条结果写盘时因 apex 共享
+`/home` 分区整体 100% 满退出（`OSError: [Errno 28] No space left on device`），不是
+显存或模型代码错误。输出 jsonl/log 均为 0 字节。已将本项目 8 个旧 smoke checkpoint
+（约 5.9G）移动到 `/tmp/cacheeopd-archive-20260801`，可恢复；清理后 `/home` 获得约
+5.9G 空间，准备重新启动同一配置。
+
+重启后实时检查点：已完成 `10/300` 题，baseline `8/10`、official fuser `7/10`；进程和
+显式 teacher 分片均正常，评测继续进行中。
+
+第二个检查点：`20/300` 题时 baseline `13/20`、official fuser `11/20`，与此前 20 题
+弱融合结果一致；这只是进度观察，正式统计仍待全量完成。
+
+当前评测进一步完成 `40/300`：baseline `26/40`、official fuser `23/40`；任务仍在运行。
+
+半程前检查点：`50/300` 题时 baseline `32/50`、official fuser `28/50`，仍与弱融合负收益
+方向一致，但最终判断以 300 题逐题配对统计为准。
+
+评测完成 `100/300`：baseline `67/100`、official fuser `58/100`；中途结果仍显示弱融合
+低于 baseline，完整配对统计待剩余 200 题完成。
+
+评测完成 `130/300`：baseline `88/130`、official fuser `77/130`；显式分片和磁盘空间仍正常。
+
+评测完成一半 `150/300`（实时监视）：磁盘仍有约 5.9G，进程保持运行；累计准确率以评测
+进程最终输出和逐题 jsonl 为准。
+
+后半段检查点：已完成 `200/300`，进程仍在运行，`/home` 余量约 5.9G；未发生新的异常。
+
+### 阶段八正式评测结果（2026-08-01，已完成）
+
+300 题任务最终正常完成，完整结果文件为：
+`/home/kejiechen/CacheEOPD/logs/eval_official_fuser_last_aligned_scale03_300.jsonl`。
+配置与登记一致：官方 fuser、`last_aligned`、`fusion_scale=0.3`、`max_new_tokens=512`、
+student `cuda:1`、teacher 显式连续分片 `cuda:2,3`。
+
+| 设置 | 正确率 | 平均生成长度 |
+|---|---:|---:|
+| baseline | 184/300 = 61.3% | 263.88 |
+| official fuser, scale=0.3 | 162/300 = 54.0% | 234.02 |
+
+逐题配对统计：
+
+- 两者都对：136；两者都错：90
+- baseline 对、fuser 错（loss）：48
+- baseline 错、fuser 对（gain）：26
+- 净 paired 变化：`26 - 48 = -22` 题，即 `-7.3pp`
+- 两臂均抽取到答案，cache 自检 `B==C 3/3`；因此不是答案抽取失败或 cache decode
+  路径不一致造成的假象。
+
+按 paired 类别的平均生成长度进一步看，`baseline 对/fuser 错` 的 48 题从 281.0 降到
+249.9 tokens，`baseline 错/fuser 对` 的 26 题也从 282.2 降到 240.7；两者都对的 136 题
+从 226.7 降到 201.0。说明弱融合整体改变了终止/轨迹长度分布，而不是只在少数题上做
+局部知识纠偏。
+
+与 20 题结果（baseline 13/20、fuser 11/20、gain 0/loss 2）方向一致；扩大到 300 题后，
+弱融合没有带来纠偏收益，反而降低正确率并缩短生成。由此确认：**修正为官方
+`last_aligned` 映射后，OpenHermes 官方 fuser 仍不能在 GSM8K 上直接帮助 0.6B student**。
+“旧 Builder 映射错误”不是负收益的唯一根因；更主要的问题是官方 fuser/训练数据与当前
+GSM8K 任务的领域和轨迹分布失配，以及 student 在测试时依赖了不一致的 teacher KV 前缀。
+
+### 阶段八决策
+
+- [x] 正确映射下完成官方 fuser 300 题验收
+- [ ] 不再继续以 OpenHermes 官方 fuser 做主要 scale sweep
+- [ ] 用 GSM8K teacher trajectory、`last_aligned` 映射重新训练 projector
+- [ ] 在同一数据、步数、学习率和评测协议下做 fused student vs plain SFT
+- [ ] 再进入真正 on-policy EOPD 的 w/ vs w/o C2C 对照
+
+下一实验应优先验证“任务域/轨迹对齐”而不是继续调融合强度：teacher 和 student 对同一
+GSM8K prompt 生成的 teacher trajectory 应用于 projector 训练；projector 的每个 student
+层按 C2C 的 `last_aligned` 映射取 teacher 层 KV。训练侧必须保留 teacher 显式分片、student
+和 projector 独立放卡的 OOM 修复。验收时同时记录 student 原生、zero-cache、fused 三路，
+并使用 paired gain/loss；只有 fused 在原生 student 不可用的题上产生稳定 gain，才进入
+EOPD 端到端实验。
+
+### 阶段九：GSM8K trajectory projector 重训登记（进行中）
+
+远端已有 `/home/kejiechen/CacheEOPD/data/teacher_traj_gsm8k1500.jsonl`，实际包含 1368
+条带 `problem/prompt/solution/label` 的 teacher trajectory，可直接作为 C2C SFT-CE 输入；
+其数据域是 GSM8K，而不是官方 fuser 使用的 OpenHermes 轨迹。当前重训计划：
+
+- student/teacher：Qwen3-0.6B / Qwen3-4B base
+- data：`teacher_traj_gsm8k1500.jsonl`，前 64 条 holdout
+- mapping：`last_aligned`
+- projector：per-layer、zero-init、可学习 gate；600 steps、lr `1e-4`、grad accum `8`
+- resources：student `cuda:1`，teacher 显式连续分片 `cuda:2,3`
+- output：`/home/kejiechen/CacheEOPD/ckpt_projector_v7_last_aligned`
+
+重训前修正了 `train_projector.py`：此前它仍使用 `device_map=auto`，可能把 teacher 层放到
+磁盘并在前向时临时搬到 student 卡；现在 auto 模式复用显式连续 teacher 分片逻辑，与评测
+和 fused student 训练一致。代码已通过本地 `py_compile` 与 `git diff --check`。
+
+重训实时检查点：step20 holdout CE `0.2318` / token acc `0.921`，相对 student baseline
+CE `0.2535` / acc `0.916` 已改善；step40 holdout CE `0.2272` / acc `0.924`，28 个 gate
+仍全部开启。训练进程继续运行，尚未进行下游生成验收。
+
+重训已到 step100：holdout CE `0.2275` / token acc `0.925`，已保存
+`ckpt_projector_v7_last_aligned/projector_step100.pt`；step80 的 holdout CE 曾达到
+`0.2236`，后续继续训练以观察是否过拟合。
+
+step180 达到当前最佳 holdout CE `0.2171` / token acc `0.928`；step200 为 CE `0.2194` /
+acc `0.926`，并已保存 `projector_step200.pt`。训练继续，后续下游验收优先检查 step140--180
+而不是默认只用最终 checkpoint。
+
+step220 holdout 回落到 CE `0.2303` / acc `0.922`，初步出现 projector 过拟合/门控退化迹象；
+继续跑到后续保存点，用 step200 作为当前可复现实验 checkpoint。
+
+训练最终完整跑到 step600（此前尝试中断时进程已继续完成），并保存
+`projector_step100/200/300/400/500/600.pt` 及 `projector_final.pt`。holdout 曲线显示：
+
+| step | holdout CE | token acc |
+|---:|---:|---:|
+| 200 | 0.2194 | 0.926 |
+| 300 | 0.2190 | 0.925 |
+| 400 | 0.2553 | 0.921 |
+| 500 | 0.2520 | 0.922 |
+| 600 | 0.2815 | 0.921 |
+
+最佳未保存的中间点约为 step180（CE 0.2171 / acc 0.928），可复现实验先使用已保存的
+step200 与 step300；final/step600 明显过拟合。28 个 key/value gate 在最终均开启，说明
+本轮 gate 没有学会关闭有害层，后续可将 gate 初始化/学习率作为单独消融，而不应把最终
+checkpoint 当作默认模型。
+
+### 阶段九小样本下游验收（已完成）
+
+在同一 50 题 GSM8K 前缀、`max_new_tokens=512`、`last_aligned` 和显式 teacher 分片下：
+
+| projector | baseline | fused | paired gain/loss | 平均长度 baseline → fused |
+|---|---:|---:|---:|---:|
+| step200 | 32/50 = 64.0% | 34/50 = 68.0% | 4 / 2 | 254.2 → 313.7 |
+| step300 | 32/50 = 64.0% | 32/50 = 64.0% | 3 / 3 | 254.2 → 299.4 |
+
+step200 是当前候选最佳，但 50 题标准误较大，不能作为最终结论。明细文件分别为
+`eval_projector_v7_step200_50.jsonl` 与 `eval_projector_v7_step300_50.jsonl`。
+已将明显过拟合的 step400/500/600/final 权重（约 1.4G）移动到
+`/tmp/cacheeopd-archive-20260801/projector_v7`，保留 step100/200/300 在实验目录。
+
+### 阶段九正式验收登记（进行中）
+
+对 `projector_step200.pt` 运行完整 300 题 GSM8K 验收，输出：
+`/home/kejiechen/CacheEOPD/logs/eval_projector_v7_step200_300.jsonl`。配置与阶段八 300
+题验收一致，目标是确认 50 题的 `+4pp` 和 paired `4/2` 是否稳定；若全量仍为正向，下一步
+再与 plain SFT 做同预算对照。
+
+### 阶段九正式验收结果（2026-08-01，已完成）
+
+`projector_step200.pt` 的完整 300 题结果：
+`/home/kejiechen/CacheEOPD/logs/eval_projector_v7_step200_300.jsonl`。
+
+| 设置 | 正确率 | 平均生成长度 |
+|---|---:|---:|
+| baseline student | 184/300 = 61.3% | 263.88 |
+| GSM8K trajectory projector step200 + `last_aligned` | 192/300 = 64.0% | 308.17 |
+
+逐题配对：两者都对 162、两者都错 86；gain（baseline 错、fused 对）30；loss（baseline
+对、fused 错）22；净变化 `+8` 题，即 `+2.7pp`。50 题预验收为 34/50 vs 32/50、gain/loss
+4/2，因此正向方向在扩大样本后保持。两臂均抽取到答案，cache 自检 `B==C 3/3`。
+
+**结论**：step200 已证明“GSM8K 域 teacher trajectory + C2C 正确 `last_aligned` 映射”
+比官方 OpenHermes fuser 更合理，并在当前 300 题上取得正向点估计；它把官方 fuser 的
+`61.3% → 54.0%` 负收益扭转为 `61.3% → 64.0%`。但 paired discordant 样本只有 52 题，
+gain/loss 差为 8，按单臂标准误/配对检验尚不足以宣称统计显著，所以必须继续做同预算
+plain SFT 对照，不能把这次结果直接归因于 C2C 的全部收益。
+
+平均长度从 263.9 增至 308.2，说明 projector 不再像官方 fuser 那样整体缩短轨迹；它更
+可能恢复了数学题所需的解题过程。不过长度增加本身不是正确率证据，后续仍以 paired
+accuracy 为主。
+
+### 阶段九决策与下一步
+
+- [x] GSM8K trajectory + `last_aligned` projector 300 题验收完成
+- [ ] 用相同 300 题/teacher trajectory、训练步数和资源做 plain SFT student 对照
+- [ ] 比较 plain SFT、trajectory projector fused student、base student 三者
+- [ ] 若 fused 优于 plain，再进入 on-policy EOPD 的 w/ vs w/o C2C 对照
+
+下一轮优先复用已验证的显式 teacher 分片和磁盘清理策略，训练 plain SFT；评测固定使用同
+一 GSM8K 300 题、同一 chat template、`max_new_tokens=512` 和逐题 paired 统计。这样可以
+区分“GSM8K teacher trajectory 本身带来的 SFT 收益”和“KV projector/C2C 额外收益”。
+
+### 与既有 plain SFT 的同题对照补充
+
+已有 `eval_plain_student.jsonl` 在同一 300 题上的 plain SFT 结果为 `189/300=63.0%`；
+新 projector step200 为 `192/300=64.0%`，base student 为 `184/300=61.3%`。逐题配对得到：
+
+- projector vs plain SFT：gain/loss `26/23`，净增 3 题（约 `+1.0pp`）
+- plain SFT vs base：gain/loss `32/27`，净增 5 题（约 `+1.7pp`）
+- 平均长度：projector `308.2`、plain SFT `293.1`、base `263.9`
+
+这说明目前主要收益很可能来自 GSM8K trajectory/任务域对齐；C2C KV projector 相比普通
+plain SFT 只有小幅点估计增益，paired 差异尚不足以称为显著。下一阶段不应直接宣称
+“C2C 已胜出”，而应做更严格的同预算训练对照、多个 seed 或更大评测集，并优先研究为何
+projector 让轨迹变长但只带来约 1pp 的额外正确率。
+
+### 阶段十：EOPD baseline 对照（进行中，2026-08-01）
+
+用户要求补充与 EOPD baseline 的公平对照。此前远端 EOPD 日志只对应 Qwen2.5-3B/
+Qwen3-8B、GSM8K、10 步 smoke，不能直接拿来和当前 Qwen3-0.6B/Qwen3-4B 的 CacheEOPD
+结果比较。本轮固定当前实验的 student/teacher 和 GSM8K 任务，先用 `Baselines/EOPD` 的
+`OnPolicyDistillTrainer` 做 5 步 smoke，再扩展到正式训练；评测仍使用同一 300 题、同一
+chat template、greedy、`max_new_tokens=512` 和同一答案抽取器。
+
+本轮对照定义：
+
+- base：未训练 Qwen3-0.6B；
+- plain：GSM8K teacher trajectory 的普通 SFT；
+- EOPD：学生 on-policy rollout + teacher token log-prob 的 EOPD；
+- CacheEOPD：GSM8K trajectory projector step200 的 `last_aligned` KV 融合。
+
+最终除了总准确率，还要输出 EOPD/CacheEOPD 的逐题 gain/loss：EOPD 对而 CacheEOPD
+错、CacheEOPD 对而 EOPD 错，以及三者共同正确/共同错误，并记录每类生成长度和答案文本。
+
+EOPD HF smoke 已完成：使用当前 Qwen3-0.6B/Qwen3-4B、student `cuda:1`、teacher
+显式分片 `cuda:2,3`，学生 on-policy 采样 64 tokens，连续更新 2 步，过程无 OOM。step1/2
+loss 为 `1.5132/1.1457`，teacher entropy 均值为 `0.074/0.124`，满足 EOPD 默认阈值
+`0.8` 的 Soft-KD token 比例仅 `3.1%/1.6%`。因此本实验的 EOPD 主要由 clipped
+reverse-KL 项驱动；正式结果需同时记录 Soft-KD 覆盖率，不能只看最终准确率。
+
+根据后续对照要求，正式 EOPD runner 使用 max response `256`、300 steps，并保存
+`step100/200/300` HF checkpoint。最终固定比较两组：EOPD step200 vs CacheEOPD projector
+step200，以及 EOPD step300 vs CacheEOPD projector step200；两组都在同一 300 题上做
+paired accuracy 和逐题题目/答案翻转分析。
+
+### 阶段十补充：EOPD step200/300 严格 self-KV 对照（已完成）
+
+为避免 batch `generate` 与 CacheEOPD 自定义 cache decode 的协议差异，EOPD step200 改用
+`eval_math_acc.py` 的 self-KV 解码路径，并将 300 题拆成三路并行评测后恢复全局索引。结果如下：
+
+| 设置 | 正确率 | 平均生成长度 |
+|---|---:|---:|
+| plain SFT | 189/300 = 63.0% | 293.1 |
+| EOPD step200（严格 self-KV） | 186/300 = 62.0% | 280.2 |
+| CacheEOPD step200 | 192/300 = 64.0% | 308.2 |
+
+CacheEOPD vs EOPD step200 的 paired 结果为：两者都对 160、两者都错 82；CacheEOPD
+额外答对 32 题，EOPD 额外答对 26 题，净增 6 题（+2.0pp）。与 batch 结果的细微差异
+来自 bf16 自回归 decode 的路径，而不是答案抽取器；后续以严格 self-KV 结果为准。
+
+严格对照中，CacheEOPD 的代表性增益包括：
+- idx26（348）：EOPD 答 288，CacheEOPD 答 348，修正了兔子/狗/猫总数的列式；
+- idx39（272）：EOPD 答 208，CacheEOPD 答 272，正确处理每周课程小时数；
+- idx42（15）：EOPD 答 -15，CacheEOPD 答 15，正确比较自己做税与雇会计的净收益；
+- idx88（1198）：EOPD 答 186，CacheEOPD 答 1198，正确合并奖品、刻字、胸针和绶带费用。
+
+代表性损失包括：
+- idx23（44）：EOPD 答 44，CacheEOPD 答 11，CacheEOPD 少算了旅行年数对应的衬衫数；
+- idx28（72）：EOPD 答 72，CacheEOPD 答 180，内盒厚度导致的内部体积计算被扰动；
+- idx30（42）：EOPD 答 42，CacheEOPD 答 120，把 7:13 比例题误读成糖用量等于总量；
+- idx60（276000）：EOPD 答 276000，CacheEOPD 答 30000，税费与注册费的合计被破坏。
+
+这说明 CacheEOPD 的收益确实集中在 EOPD 本身算错的题上，但仍会扰动 EOPD 已经答对的
+题；因此当前证据支持“同一步数下 CacheEOPD 可能更有效”，尚不能支持“CacheEOPD step200
+必然超过 EOPD step300”。
+
+step300 严格 self-KV 结果如下：
+
+| 设置 | 正确率 | 平均生成长度 |
+|---|---:|---:|
+| plain SFT | 189/300 = 63.0% | 293.1 |
+| EOPD step300（严格 self-KV） | 193/300 = 64.3% | 282.2 |
+| CacheEOPD step200 | 192/300 = 64.0% | 308.2 |
+
+CacheEOPD vs EOPD step300 的 paired 结果为：两者都对 166、两者都错 81；CacheEOPD
+额外答对 26 题，EOPD 额外答对 27 题，净变化 `-1` 题（-0.3pp）。因此“CacheEOPD
+step200 超过 EOPD step300”没有得到支持；更准确的结论是 CacheEOPD 在 step200 已达到
+与 EOPD step300 几乎相同的效果，但本次严格评测仍略低 1 题。
+
+跨步数对照的趋势是：CacheEOPD step200 相比 EOPD step200 为 `32 gain / 26 loss`，净增
+6 题；EOPD 继续训练到 step300 后，相比 CacheEOPD 变为 `27 gain / 26 loss`，净增 1 题。
+这支持“CacheEOPD 可能更快获得有效监督/达到较好点”的弱结论，不支持“KV 融合必然提高
+最终上限”。此外两者 step 不能直接视为等价计算量：EOPD 更新 student 权重，CacheEOPD
+训练的是 projector 且评测时仍需要 teacher KV。
+
+严格结果文件：`logs/three_way_strict_step200.jsonl`、
+`logs/three_way_strict_step200_summary.json`、`logs/three_way_strict_step300.jsonl`、
+`logs/three_way_strict_step300_summary.json`（远端 CacheEOPD 实验目录）。
+
+严格 paired 题号集合（idx 从 0 开始）：
+- step200 CacheEOPD gain：26, 39, 42, 45, 54, 59, 62, 88, 91, 97, 99, 100, 101, 118, 119, 124, 140, 143, 149, 179, 185, 193, 201, 205, 207, 224, 231, 245, 265, 267, 276, 286；loss：23, 28, 30, 60, 86, 141, 166, 173, 176, 186, 190, 196, 198, 203, 209, 212, 229, 234, 236, 238, 239, 242, 248, 254, 255, 280。
+- step300 CacheEOPD gain：24, 26, 39, 57, 62, 88, 91, 97, 99, 100, 101, 130, 142, 143, 157, 164, 179, 185, 193, 201, 207, 219, 232, 245, 267, 279；loss：23, 28, 50, 60, 63, 73, 84, 86, 148, 166, 176, 181, 186, 190, 196, 198, 209, 212, 217, 229, 234, 236, 238, 239, 242, 254, 255。
+
+### 阶段十一：CacheEOPD student 权重无 teacher 独立评测（已完成，2026-08-02）
+
+针对“评测时不应依赖 teacher KV”的修正，本阶段使用真正不加载 teacher 的
+`eval_student_batch.py`，直接加载 `ckpt_student_fused/student_stepN` 或
+`ckpt_student_plain/student_stepN`，只调用 student 原生 batch greedy generation。所有模型
+使用相同的 300 题、chat template、batch size 8 和 `max_new_tokens=512`；这与之前
+`eval_math_acc.py` 的 self-KV 单题路径不同，因此结果只在本阶段内部横向比较。
+
+| checkpoint | standalone 正确率 | 平均生成长度 |
+|---|---:|---:|
+| base student | 181/300 = 60.3% | 257.9 |
+| plain step100 | 189/300 = 63.0% | 295.0 |
+| fused step100 | 185/300 = 61.7% | 263.4 |
+| plain step200 | 177/300 = 59.0% | 299.9 |
+| fused step200 | 179/300 = 59.7% | 272.1 |
+| plain step300 | 182/300 = 60.7% | 292.5 |
+| fused step300 | 170/300 = 56.7% | 268.2 |
+
+fused vs plain 的 paired gain/loss 为：step100 `25/29`（净 -4）、step200 `32/30`（净 +2）、
+step300 `25/37`（净 -12）。因此在真正独立的 student 权重评测下，C2C fused 训练没有稳定
+超过 plain SFT；step300 明显退化，表现为 fused 特异的过拟合或训练目标失配。之前
+`projector_step200` 的 `192/300` 不能作为独立 student 结果，它属于 teacher KV 辅助推理。
+
+本阶段结果文件：`logs/eval_standalone_{fused,plain}_step{100,200,300}.jsonl`，以及
+`logs/standalone_three_way_step{100,200,300}_summary.json`（远端 CacheEOPD 实验目录）。
+
+### 阶段十二：student-only mixed / anneal 交替注入实验（进行中，2026-08-02）
+
+本阶段目标是训练 student，而不是继续训练 projector。projector 在训练前加载并冻结，optimizer
+只接收 student 参数；评测统一不加载 teacher，也不使用 teacher KV。训练数据仍为
+`data/teacher_traj_gsm8k1500.jsonl`，保存和 holdout 检查间隔均为 50 步。
+
+当前先使用此前验证过的本项目 projector：
+`ckpt_projector_v7_last_aligned/projector_step200.pt`。该 projector 的 teacher-assisted
+探针为 192/300，相比 base 184/300，因此暂时保留；它不代表独立 student 结果。
+
+当前运行组：
+
+| 组别 | projector | KV 注入策略 | 配置 | 状态 |
+|---|---|---|---|---|
+| mixed_v7 | prior v7 | 每个 micro-batch 随机注入 | `p=0.5`, 300 steps, `lr=1e-5`, `grad_accum=8` | 第 100 步，已保存 step50/100 |
+| anneal_v7 | prior v7 | 注入概率线性退火 | `p: 1.0 -> 0.0`, 300 steps | 待启动 |
+
+`mixed_v7` 当前日志中的 plain holdout CE：step50=`0.2346`，step100=`0.2288`。最终判断以
+各 step 的无 teacher 独立准确率为准，并与 no-distillation/plain、EOPD dense checkpoint
+以及已有 EOPD 结果做 paired 题目级比较。
+
+训练在首次运行至 step250 时因远端 `/home` 磁盘空间不足而在保存半成品时退出；step50--200
+完整权重和日志未受影响。已将旧的 `ckpt_student_fused`、`ckpt_student_plain` 权重目录以及
+失败的 step250 半成品移至远端 `/tmp` 的可恢复归档目录，释放空间后用相同 seed/config 重启
+`mixed_v7`，以确保 step250/300 也完整保存。
+
+`mixed_v7` 重启后已完成全部 300 步，plain holdout CE 为：step50=`0.2346`、step100=`0.2286`、
+step150=`0.2227`、step200=`0.2210`、step250=`0.2206`、step300=`0.2171`。六个 checkpoint
+均已保存。当前正在 GPU1--5 并行进行真正不加载 teacher 的 300 题 greedy 评测；评测输出为
+`logs/eval_mixed_v7_step{50,100,150,200,250,300}.jsonl`。
+
+mixed 已完成的独立准确率：step50=`181/300`、step100=`180/300`、step150=`186/300`、
+step200=`192/300`、step250=`190/300`、step300=`188/300`。对应平均生成长度依次为
+288.35、292.55、291.90、289.27、301.92、289.75；六个结果文件均已完成。
+
+`anneal_v7` 已启动（PID 1366451）：同一 prior v7 projector、同一 student-only 目标和资源，
+仅使用 `anneal-start-prob=1.0`、`anneal-end-prob=0.0`、`anneal-steps=300`，同样每 50 步保存。
+
+`anneal_v7` 已完成 step50--300 全部保存；plain holdout CE 为：step50=`0.2514`、
+step100=`0.2387`、step150=`0.2276`、step200=`0.2223`、step250=`0.2181`、step300=`0.2131`。
+当前正在 GPU1--5 并行做 anneal 的 student-only 300 题评测，输出为
+`logs/eval_anneal_v7_step{50,100,150,200,250,300}.jsonl`。
+
+为完成三方对照，已将 mixed 权重移至远端 `/tmp/cacheeopd_ckpt_student_mixed_v7_archive_20260802`
+（结果 JSONL 和日志仍在 `CacheEOPD/logs`），并启动 EOPD dense baseline：student-only 更新、
+teacher 分片 GPU2/3、student GPU1、`lr=1e-6`、300 steps、`save-every=50`，输出目录为
+`ckpt_eopd_dense`，日志为 `logs/train_eopd_dense.log`。
+
+EOPD dense 已完成 300 steps，`step50`、`step100`、`step150`、`step200`、`step250`、`step300`
+全部保存。当前正在 GPU1--5 并行进行同一 300 题、同一 chat template、batch=8、
+`max-new-tokens=512` 的 student-only 独立评测，输出为
+`logs/eval_eopd_dense_step{50,100,150,200,250,300}.jsonl`。
+
+### 阶段十三：mixed / anneal / EOPD 三方独立结果（已完成，2026-08-02）
+
+三组都直接加载 student checkpoint，评测时不加载 teacher、不构造 teacher KV；统一使用
+GSM8K-COT 300 题、同一 chat template、greedy、batch size 8、`max-new-tokens=512`。
+此前同协议 base student 为 `181/300`，平均生成长度 257.92。
+
+| step | mixed | anneal | EOPD dense |
+|---:|---:|---:|---:|
+| 50 | 181/300 (288.35) | 178/300 (268.38) | 188/300 (268.39) |
+| 100 | 180/300 (292.55) | 188/300 (284.62) | 175/300 (274.81) |
+| 150 | 186/300 (291.90) | 187/300 (290.57) | 183/300 (273.80) |
+| 200 | **192/300 (289.27)** | 184/300 (288.72) | 185/300 (275.56) |
+| 250 | 190/300 (301.92) | 189/300 (306.53) | 190/300 (279.99) |
+| 300 | 188/300 (289.75) | 189/300 (295.50) | 186/300 (282.34) |
+
+括号内为平均生成 token 数。相对 base，mixed 最佳 step200 净增 11 题（+3.67pp）；
+anneal 最佳 step250 净增 8 题（+2.67pp）；EOPD dense 最佳 step50/250 净增 7/9 题，
+但 EOPD 曲线在 step100--200 有明显波动。三组 raw 逐题结果分别为：
+`logs/eval_mixed_v7_step{50,100,150,200,250,300}.jsonl`、
+`logs/eval_anneal_v7_step{50,100,150,200,250,300}.jsonl`、
+`logs/eval_eopd_dense_step{50,100,150,200,250,300}.jsonl`。
+
+#### 同一步数 paired 对照
+
+下表格式为“候选相对 EOPD 的 gain / loss / 净变化”，gain 表示候选答对而 EOPD 答错，
+loss 表示 EOPD 答对而候选答错：
+
+| step | mixed vs EOPD | anneal vs EOPD | anneal vs mixed |
+|---:|---:|---:|---:|
+| 50 | 20 / 27 / -7 | 20 / 30 / -10 | 19 / 22 / -3 |
+| 100 | 28 / 23 / +5 | 36 / 23 / +13 | 32 / 24 / +8 |
+| 150 | 25 / 22 / +3 | 26 / 22 / +4 | 17 / 16 / +1 |
+| 200 | 31 / 24 / +7 | 26 / 27 / -1 | 10 / 18 / -8 |
+| 250 | 27 / 27 / 0 | 21 / 22 / -1 | 16 / 17 / -1 |
+| 300 | 31 / 29 / +2 | 31 / 28 / +3 | 24 / 23 / +1 |
+
+这表明交替注入不是稳定的单调收益：mixed 在 step100--200 更有优势，anneal 在 step100
+和 step300 更好；两者都没有在所有训练区间稳定胜过 EOPD。
+
+#### 重点题目级比较
+
+最有代表性的公平比较是 mixed step200（192）对 EOPD step200（185）：mixed 额外答对
+31 题，丢失 24 题，净增 7 题。gain 题号（括号为标准答案）为：
+`33(10), 40(80), 45(95), 47(350), 48(23), 57(54), 59(90), 84(9), 97(12), 119(16),
+121(2), 124(29), 130(82), 139(6), 143(312), 150(330000), 157(25), 158(200), 169(22),
+174(4), 175(250), 204(8), 207(6), 215(17), 259(93), 263(7300), 267(20), 271(19),
+277(520), 286(54), 289(27)`；loss 题号为：
+`26(348), 42(15), 46(100), 54(114,200), 63(27000), 93(350), 141(30), 145(4800),
+146(1050), 162(1), 181(16), 190(30), 196(10), 201(480), 203(15), 205(5), 212(2000),
+229(6000), 231(45), 236(160), 249(113), 255(25), 284(147), 294(60)`。
+
+跨训练长度的对照 mixed step200（192）对 EOPD step300（186）仍为 28 gain / 22 loss，
+净增 6 题。gain 为：
+`24(22), 40(80), 45(95), 91(240000), 97(12), 121(2), 124(29), 130(82), 139(6),
+140(8), 143(312), 150(330000), 157(25), 158(200), 164(4), 169(22), 175(250), 184(19),
+204(8), 207(6), 215(17), 219(30), 232(12), 263(7300), 267(20), 271(19), 286(54),
+289(27)`；loss 为：
+`26(348), 30(42), 46(100), 54(114,200), 63(27000), 88(1198), 93(350), 145(4800),
+146(1050), 162(1), 181(16), 190(30), 196(10), 200(1), 210(60), 212(2000), 225(15),
+231(45), 249(113), 255(25), 284(147), 294(60)`。
+
+代表性 gain 题型包括：闹钟/跑步/土豆的多步比例或速率题（idx24/40/45）、设备折旧与
+成本题（idx91/150）、年龄差和数量关系题（idx97/121/219）、洗衣用水与产量题
+（idx143/263）。代表性 loss 包括：兔狗猫总数列式（idx26）、糖水比例（idx30）、
+化妆师成本（idx63）、奖品总成本（idx88）、珠宝价格（idx145）、徽章速度（idx190）、
+水池抽水（idx212）、图片平均分配（idx231）。因此 CacheEOPD 确实修正一部分 EOPD
+错误，但也会扰动 EOPD 原本正确的列式、比例和费用题；收益不是无条件的能力提升。
+
+本阶段结论：在当前 0.6B student、1500 条轨迹和 prior v7 projector 下，student-only
+的 mixed/anneal 交替策略是可行且有局部收益的，mixed step200 达到 64.0%，高于 base
+60.3%、同一步 EOPD 61.7%，也略高于 EOPD step300 的 62.0%。但它没有证明 KV 注入提高
+最终上限；更准确的结论是“适度交替注入可能改变有效训练速度和最优 checkpoint 区间”，
+其中 mixed 比 anneal 更稳定，后续大规模实验应优先围绕 mixed 的注入比例、注入时机和
+更密的 step150--250 区间做消融。
+
+anneal 已完成的独立准确率：step50=`178/300`（平均 268.38 tokens）、step100=`188/300`
+（284.62）、step150=`187/300`（290.57）、step200=`184/300`（288.72）、step250=`189/300`
+（306.53）、step300=`189/300`（295.50）。六个结果文件均已完成。
+
+### 阶段十四：mixed 多 seed 稳定性消融（已完成，2026-08-02）
+
+为检验 mixed step200 的 `192/300` 是否只是单次随机种子波动，新增两个完全相同配置的
+多 seed 训练：`seed=41718` 和 `seed=41719`。两组均训练 student，不更新 projector；训练时
+每个 micro-batch 以 `p=0.5` 注入 teacher KV，训练 300 步、`grad_accum=8`、`lr=1e-5`，
+每 50 步保存 checkpoint，并使用同一个 prior v7 projector：
+`ckpt_projector_v7_last_aligned/projector_step200.pt`。
+
+评测协议预先固定为 student-only：加载学生 checkpoint 时不加载 teacher、不加载 projector、
+不注入 teacher KV，只使用 student 自己的 KV cache；与阶段十三相同的 GSM8K-COT 300 题、
+greedy、batch size 8、`max-new-tokens=512`。训练输出分别为：
+`ckpt_student_mixed_v7_seed41718`、`ckpt_student_mixed_v7_seed41719`；训练日志分别为：
+`logs/train_mixed_v7_seed41718.log`、`logs/train_mixed_v7_seed41719.log`。
+
+`seed=41718` 已完成训练和 student-only 独立评测。训练日志为
+`logs/train_mixed_v7_seed41718.log`，六个 raw 评测文件为
+`logs/eval_mixed_v7_seed41718_step{50,100,150,200,250,300}.jsonl`。结果如下：
+
+| step | mixed seed41718 | 平均生成长度 |
+|---:|---:|---:|
+| 50 | 188/300 (62.67%) | 284.31 |
+| 100 | 184/300 (61.33%) | 298.02 |
+| 150 | 186/300 (62.00%) | 289.26 |
+| 200 | 189/300 (63.00%) | 295.52 |
+| 250 | **199/300 (66.33%)** | 298.33 |
+| 300 | 198/300 (66.00%) | 300.52 |
+
+该 seed 的最佳点移动到 step250，暂时没有复现 seed41717 的 step200=`192/300`，但整体
+验证了 mixed 的有效区间可能在 step200--300，并说明单个 seed 的最优 checkpoint 不足以
+代表稳定峰值。评测过程中发现训练脚本不会把 tokenizer 同步到 step 子目录，已在远端为
+每个 checkpoint 补齐 tokenizer 文件；同时统一使用实际数据文件
+`taopd-baseline/data/GSM8K-COT/gsm8k_cot_slime_300_seed41717.jsonl`。
+
+为释放 `/home` 空间，seed41718 权重完整归档到远端
+`/dev/shm/cacheeopd_ckpt_student_mixed_v7_seed41718_archive_20260802`，raw 结果和日志仍在
+`CacheEOPD/logs`。
+
+`seed=41719` 已完成训练和 student-only 独立评测。训练日志为
+`logs/train_mixed_v7_seed41719.log`，评测文件为
+`logs/eval_mixed_v7_seed41719_step{50,100,150,200,250,300}.jsonl`。结果如下：
+
+| step | mixed seed41719 | 平均生成长度 |
+|---:|---:|---:|
+| 50 | 191/300 (63.67%) | 292.82 |
+| 100 | 190/300 (63.33%) | 297.07 |
+| 150 | 189/300 (63.00%) | 296.06 |
+| 200 | 186/300 (62.00%) | 296.53 |
+| 250 | **195/300 (65.00%)** | 303.20 |
+| 300 | 195/300 (65.00%) | 290.52 |
+
+当前三个 seed 的最佳点分别为：原 seed41717 的 step200=`192/300`、seed41718 的
+step250=`199/300`、seed41719 的 step250/300=`195/300`。这已经显示 mixed 的收益区间
+可能稳定落在 200--300 步附近，但最佳 step 会随 seed 移动；最终均值/标准差和 paired
+统计待官方 fuser 对照完成后统一计算。
+
+为释放 `/home` 空间，seed41719 权重随后归档到远端
+`/dev/shm/cacheeopd_ckpt_student_mixed_v7_seed41719_archive_20260802`，raw 结果和日志仍在
+`CacheEOPD/logs`。
+
+#### 阶段十四补充：官方 fuser 泛化性对照（已完成）
+
+为检验 mixed 的收益是否依赖于专门针对 GSM8K 重新训练的 projector，新增一组官方 fuser
+对照。训练仍使用同一 student-only mixed 策略（`p=0.5`、300 步、`lr=1e-5`、
+`grad_accum=8`、每 50 步保存），只将 projector 替换为官方：
+`/home/kejiechen/taopd-baseline/modelweights/qwen3_0.6b+qwen3_4b_base_Fuser/final`。
+为便于比较，计划沿用 `seed=41717`，输出到
+`ckpt_student_mixed_official_v7_seed41717`，并重点独立评测 step150/200/250/300；
+评测时仍不加载 teacher、不加载 projector、不注入 teacher KV。
+
+训练日志为 `logs/train_mixed_official_v7_seed41717.log`，student-only 评测文件为
+`logs/eval_mixed_official_v7_seed41717_step{150,200,250,300}.jsonl`。结果如下：
+
+| projector | step150 | step200 | step250 | step300 |
+|---|---:|---:|---:|---:|
+| prior v7（同 seed41717） | 186 | **192** | 190 | 188 |
+| 官方 fuser（同 seed41717） | 187 | 186 | **194** | 176 |
+
+官方 fuser 的平均生成长度分别为 302.73、299.09、304.07、291.95 tokens。相对同 seed
+prior-v7 mixed 的逐题 paired gain/loss 为：step150=`26/25`（净+1）、step200=`26/32`
+（净-6）、step250=`28/24`（净+4）、step300=`21/33`（净-12）。因此官方 fuser 并非
+完全不能用于 mixed：它在 step250 达到 `194/300`，与 prior-v7 三 seed 的均值接近；
+但它不能复现 prior-v7 的 step200=`192/300`，且 step300 明显不稳定。结论是 mixed 训练
+策略对 projector 有一定泛化性，但 projector 质量和训练步数共同决定最优区间；不能把
+官方 fuser 的单个峰值或 prior-v7 的单个峰值直接当作普遍规律。
+
+三个 prior-v7 seed 的 student-only accuracy 均值/总体标准差如下（seed41717/41718/41719）：
+
+| step | 三 seed 原始结果 | 均值 ± std |
+|---:|---:|---:|
+| 50 | 181, 188, 191 | 186.67 ± 4.19 |
+| 100 | 180, 184, 190 | 184.67 ± 4.11 |
+| 150 | 186, 186, 189 | 187.00 ± 1.41 |
+| 200 | 192, 189, 186 | 189.00 ± 2.45 |
+| 250 | 190, 199, 195 | **194.67 ± 3.68** |
+| 300 | 188, 198, 195 | **193.67 ± 4.19** |
+
+多 seed 结果不支持“mixed 必然在 step200 达到 192”，但支持更稳健的表述：在当前配置
+下，mixed 的较优区间集中在 step200--300，三 seed 的平均最佳点为 step250；官方 fuser
+也在 step250 出现局部峰值。这增强了“交替 KV 改变有效训练速度/最优 checkpoint 区间”
+的证据，但仍不能证明它提高最终能力上限。所有上述 accuracy 都是独立 student-only
+评测，不加载 teacher、不加载 projector、不注入 teacher KV。
