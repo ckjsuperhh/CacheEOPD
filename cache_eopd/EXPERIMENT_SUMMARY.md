@@ -1,5 +1,22 @@
 # CacheEOPD 阶段性实验汇报
 
+## 实验转向：从一直带着做，到教学与考试交替
+
+最初的方案是在 student 训练和 rollout 中始终注入 teacher KV，等价于老师全程带着
+学生完成每一步。这个方案造成了明显的训练-评测不一致：训练时 student 依赖 teacher KV，
+独立考试时却只能使用自己的 KV。
+
+在 student-only 评测下，早期 always-fused 实验的代表性结果为：base student=`181/300`，
+plain step100/200/300=`189/177/182`，always-fused step100/200/300=`185/179/170`。
+尤其 step300 的 fused student 明显退化。这说明“始终让老师带着”可能让 student 学会了
+依赖外部 cache，而不是稳定地形成自己的 rollout 能力；此前 teacher-assisted 的
+`192/300` 也不能当作独立 student 能力。
+
+这个失败引导了后续设计：教学时可以让老师手把手纠正，但必须反复让学生独立完成任务，
+再接受下一轮教学。于是我们提出 mixed 和 anneal 两种交替策略：mixed 固定概率地在
+micro-batch 间切换 teacher KV 与 student KV，anneal 则逐步减少 teacher KV，让训练后期
+更接近“考试”。
+
 ## 目标
 
 CacheEOPD 将 C2C 的 teacher KV 投影融合到 EOPD 的 student rollout 中。本阶段进一步
