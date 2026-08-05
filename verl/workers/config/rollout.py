@@ -29,6 +29,7 @@ __all__ = [
     "TraceConfig",
     "ServerConfig",
     "PrometheusConfig",
+    "C2CConfig",
     "RolloutConfig",
 ]
 
@@ -118,6 +119,21 @@ class PrometheusConfig(BaseConfig):
 
 
 @dataclass
+class C2CConfig(BaseConfig):
+    enable: bool = False
+    teacher_path: Optional[str] = None
+    projector_path: Optional[str] = None
+    fuser_dir: Optional[str] = None
+    teacher_device: Optional[str] = None
+    layer_mapping: str = "last_aligned"
+    kv_connector: str = "CacheEOPDConnector"
+    kv_role: str = "kv_both"
+    kv_connector_module_path: str = "cache_eopd.vllm_kv_connector"
+    disable_chunked_prefill: bool = True
+    disable_prefix_caching: bool = True
+
+
+@dataclass
 class RolloutConfig(BaseConfig):
     _mutable_fields = {"max_model_len", "load_format"}
 
@@ -169,6 +185,8 @@ class RolloutConfig(BaseConfig):
 
     multi_stage_wake_up: bool = False
     engine_kwargs: dict = field(default_factory=dict)
+
+    c2c: C2CConfig = field(default_factory=C2CConfig)
 
     calculate_log_probs: bool = False
 

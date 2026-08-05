@@ -40,8 +40,12 @@ from vllm.outputs import RequestOutput
 from vllm.usage.usage_lib import UsageContext
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.engine.core import EngineCoreProc
-from vllm.v1.engine.utils import CoreEngineProcManager
 from vllm.v1.executor.abstract import Executor
+
+try:
+    from vllm.v1.engine.utils import CoreEngineProcManager
+except (ImportError, ModuleNotFoundError):
+    CoreEngineProcManager = None
 
 from verl.single_controller.ray import RayClassWithInitArgs
 from verl.utils.config import omega_conf_to_dataclass
@@ -68,7 +72,13 @@ if _VLLM_VERSION > version.parse("0.11.0"):
 
         get_encoding()
 else:
-    from vllm.utils import FlexibleArgumentParser, get_tcp_uri
+    from vllm.utils import FlexibleArgumentParser
+
+    try:
+        from vllm.utils import get_tcp_uri
+    except ImportError:
+        def get_tcp_uri(host: str, port: int) -> str:
+            return f"tcp://{host}:{port}"
 if _VLLM_VERSION >= version.parse("0.12.0"):
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
     from vllm.v1.outputs import ModelRunnerOutput
@@ -195,7 +205,12 @@ class vLLMHttpServerBase:
 
         self.config: RolloutConfig = omega_conf_to_dataclass(config)
         self.model_config: HFModelConfig = omega_conf_to_dataclass(model_config, dataclass_type=HFModelConfig)
-        self.config.max_model_len = self.config.prompt_length + self.config.response_length
+        if self.config.max_model_len is None:
+            self.config.max_model_len = self.config.prompt_length + self.config.response_length
+        elif self.config.max_model_len < self.config.prompt_length + self.config.response_length:
+            raise ValueError(
+                "rollout.max_model_len must be at least prompt_length + response_length"
+            )
         self.rollout_mode = rollout_mode
         self.workers = workers
 
@@ -243,6 +258,25 @@ class vLLMHttpServerBase:
         # 1. setup vllm serve cli args
         engine_kwargs = self.config.get("engine_kwargs", {}).get("vllm", {}) or {}
         engine_kwargs = {key: val for key, val in engine_kwargs.items() if val is not None}
+        c2c_cfg = self.config.get("c2c", {}) or {}
+        if c2c_cfg.get("enable", False):
+            if _VLLM_VERSION < version.parse("0.13.0"):
+                raise RuntimeError(
+                    "CacheEOPD vLLM fusion requires vLLM >= 0.13.0 with the V1 KV connector API"
+                )
+            transfer_config = dict(engine_kwargs.get("kv_transfer_config", {}) or {})
+            transfer_config.setdefault("kv_connector", c2c_cfg.get("kv_connector", "CacheEOPDConnector"))
+            transfer_config.setdefault("kv_role", c2c_cfg.get("kv_role", "kv_both"))
+            transfer_config.setdefault(
+                "kv_connector_module_path",
+                c2c_cfg.get("kv_connector_module_path", "cache_eopd.vllm_kv_connector"),
+            )
+            engine_kwargs["kv_transfer_config"] = transfer_config
+            engine_kwargs.setdefault("disable_hybrid_kv_cache_manager", True)
+            if c2c_cfg.get("disable_chunked_prefill", True):
+                self.config.enable_chunked_prefill = False
+            if c2c_cfg.get("disable_prefix_caching", True):
+                self.config.enable_prefix_caching = False
         if self.config.get("limit_images", None):  # support for multi-image data
             engine_kwargs["limit_mm_per_prompt"] = {"image": self.config.get("limit_images")}
         if self.config.cudagraph_capture_sizes:
@@ -314,6 +348,9 @@ class vLLMHttpServerBase:
             "hf_overrides": hf_overrides,
             **engine_kwargs,
         }
+
+        if _VLLM_VERSION < version.parse("0.9.0"):
+            args.pop("logprobs_mode", None)
 
         if self.config.prometheus.enable:
             if self.config.prometheus.served_model_name:
@@ -417,8 +454,9 @@ class vLLMHttpServerBase:
 
         engine_client = AsyncLLM.from_vllm_config(vllm_config=vllm_config, usage_context=usage_context, **kwargs)
 
-        # Don't keep the dummy data in memory
-        await engine_client.reset_mm_cache()
+        reset_mm_cache = getattr(engine_client, "reset_mm_cache", None)
+        if reset_mm_cache is not None:
+            await reset_mm_cache()
 
         app = build_app(args)
         if _VLLM_VERSION > version.parse("0.11.0"):
@@ -432,6 +470,11 @@ class vLLMHttpServerBase:
         self._server_port, self._server_task = await run_unvicorn(app, args, self._server_address)
 
     async def run_headless(self, args: argparse.Namespace):
+        if CoreEngineProcManager is None:
+            raise RuntimeError(
+                "vLLM headless data-parallel rollout requires a newer vLLM version; "
+                "vLLM 0.8.x supports the single-node run_server path only."
+            )
         # Create the EngineConfig.
         engine_args = vllm.AsyncEngineArgs.from_cli_args(args)
         usage_context = UsageContext.OPENAI_API_SERVER
@@ -466,6 +509,21 @@ class vLLMHttpServerBase:
         video_data: Optional[list[Any]] = None,
     ) -> TokenOutput:
         """Generate sequence with token-in-token-out."""
+        sampling_params = dict(sampling_params)
+        c2c_cfg = self.config.get("c2c", {}) or {}
+        kv_transfer_params = sampling_params.pop("kv_transfer_params", None)
+        if kv_transfer_params is None:
+            kv_transfer_params = sampling_params.pop("cache_eopd", None)
+        if c2c_cfg.get("enable", False) and not kv_transfer_params:
+            raise ValueError(
+                "CacheEOPD vLLM rollout requires sampling_params.kv_transfer_params "
+                "with a fused KV packet; refusing to fall back to plain vLLM"
+            )
+        extra_args = dict(sampling_params.pop("extra_args", {}) or {})
+        if kv_transfer_params:
+            extra_args["kv_transfer_params"] = kv_transfer_params
+        if extra_args:
+            sampling_params["extra_args"] = extra_args
         # Calculate the maximum possible new tokens based on available context space
         # This serves as a safety upper bound
         max_possible_tokens = self.config.max_model_len - len(prompt_ids)

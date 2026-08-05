@@ -122,6 +122,17 @@ engine_kwargs:
   # sglang engine config
   sglang: {}
 
+# CacheEOPD vLLM V1 packet injection.  The request must carry
+# sampling_params.kv_transfer_params.packet_path; when disabled, vanilla
+# vLLM behavior is unchanged.
+c2c:
+  enable: False
+  kv_connector: CacheEOPDConnector
+  kv_role: kv_both
+  kv_connector_module_path: cache_eopd.vllm_kv_connector
+  disable_chunked_prefill: True
+  disable_prefix_caching: True
+
 # Sampling parameters used during validation.
 val_kwargs:
 

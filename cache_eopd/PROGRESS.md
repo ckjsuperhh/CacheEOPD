@@ -1400,3 +1400,787 @@ prior-v7 mixed 的逐题 paired gain/loss 为：step150=`26/25`（净+1）、ste
 也在 step250 出现局部峰值。这增强了“交替 KV 改变有效训练速度/最优 checkpoint 区间”
 的证据，但仍不能证明它提高最终能力上限。所有上述 accuracy 都是独立 student-only
 评测，不加载 teacher、不加载 projector、不注入 teacher KV。
+
+### 阶段十五：按 EOPD 原论文扩大对照（启动于 2026-08-02）
+
+本阶段转向严格的官方 EOPD 训练口径，目标不是继续把 GSM8K 上的 projector 结果外推，而是
+在同一训练入口、同一学生/教师规模和同一评测协议下，比较官方 EOPD 与 CacheEOPD：
+
+- 论文：`Entropy-Aware On-Policy Distillation of Language Models`，Jin et al.，ICML 2026，
+  arXiv:2603.07079v3，代码仓库 `WLS04/EOPD`。
+- 论文配置：Qwen3-1.7B-Base student、Qwen3-8B teacher（non-thinking）、MATH 训练集、
+  3 epochs、batch 128 / mini-batch 32、teacher top-k 16、`tau=0.8`、`alpha=1.0`、
+  训练 response 上限 4096。
+- 论文评测：MATH500、AMC23、Minerva、OlympiadBench、AIME24、AIME25，temperature 1.0、
+  top-p 0.8、每题 8 次采样，报告 Avg@8 与 Pass@8。
+
+#### 对照设计
+
+1. 官方 EOPD：官方 `OnPolicyDistillTrainer` + vLLM rollout，使用 clipped reverse-KL 和
+   teacher entropy-gated top-k forward-KL。
+2. CacheEOPD-EOPD：保持同一 EOPD loss、数据、优化器和训练预算，只把 student rollout
+   换为 `c2c_hf`，在生成前缀阶段注入 teacher KV；生成完成后仍按普通 EOPD 方式计算 loss。
+3. 评测两组都只加载保存后的 student 权重，不加载 teacher KV、不依赖 teacher 推理；先按
+   50 step 保存 checkpoint，再在相同 checkpoint 上做 student-only 六基准评测。
+
+#### 当前状态
+
+- 已阅读论文原文及 Appendix A/F，确认本阶段不能把前面 0.6B、GSM8K、student-only HF
+  训练结果冒充论文级 EOPD 对照。
+- 已核对本地官方代码入口 `eopd-baseline/examples/on_policy_distillation/on_policy_it.sh`，
+  以及 CacheEOPD 的 `c2c_hf` rollout 接入点 `verl/workers/fsdp_workers.py`。
+- 已在 apex-llm 上完成资源/显存冒烟；正式训练日志、checkpoint、六基准分数和逐题对照
+  尚未产生。若严格三 epoch 的 4096-token 配置超出共享机器吞吐，将先保留相同预算的
+  缩短 response pilot，并明确标注为 pilot，不与论文最终数字混写。
+
+#### 阶段十五补充：vLLM 映射与多卡冒烟记录（2026-08-02）
+
+本次继续按 `kejiechen/CacheEOPD` 工作区推进，没有修改 `knhdu` 或 `yuanxigu` 的任何文件。
+首先修复了一个实际的 Hydra 配置映射错误：`soft_kd_entropy_threshold` 和
+`soft_kd_loss_coef` 原先被错误放在 `ActorConfig`，但 yaml 实际实例化的是
+`PolicyLossConfig`，因此训练在配置实例化阶段报 `unexpected keyword argument`。现在两个
+字段已归位到 `PolicyLossConfig`，本地和 kejiechen 远端均已同步。
+
+vLLM 后端本身已完成 TP4 冒烟：在 GPU 1、2、4、5 上加载 Qwen3-0.6B，
+`tensor_parallel_size=4`、`max_model_len=2048`，health check 和 completion 请求均成功。
+远端 FlashInfer sampler 的 JIT 编译因系统缺少 `math.h` 失败，使用
+`VLLM_USE_FLASHINFER_SAMPLER=0` 后正常；这属于环境 workaround，不是 vLLM 映射错误。
+
+端到端 1-step 训练依次排除了以下配置问题：
+
+1. 默认 `critic` 会读取不存在的 `~/models/deepseek-llm-7b-chat`；EOPD 应使用
+   `algorithm.adv_estimator=on_policy`，从而关闭 critic 并在 policy loss 内计算 dummy
+   advantage。
+2. 当前 `RLHFDataset` 入口只接受 Parquet，已改用 `/home/kejiechen/data/gsm8k/*.parquet`；
+   `val_files` 不能为 null，冒烟时使用 GSM8K test 文件。
+3. 4 卡归一化下 global `ppo_mini_batch_size=2` 会变成 0，已改为 batch/mini-batch=8，
+   每卡 micro-batch=1。
+4. 远端 `flash-attn` wheel 需要 glibc 2.32，而系统版本不满足；训练侧改用
+   `attn_implementation=sdpa`，vLLM 仍独立使用自己的 attention backend。
+
+清理此前遗留的 kejiechen TP4 vLLM server 后，GPU 资源已恢复；不触碰 GPU0 上的 knhdu
+进程。随后用干净 GPU 反复尝试 teacher Qwen3-4B 的 FSDP 初始化，分别测试了：
+`fsdp2 + bf16`、`fsdp1 + bf16`、关闭 remove-padding、关闭 torch.compile 和参数 offload。
+它们都能完成 Hydra 校验、数据集构建、Gloo 建组、teacher checkpoint 读取，并在
+`Qwen3ForCausalLM` FSDP wrap 阶段发生原生 SIGSEGV，尚未进入 rollout 或 optimizer step。
+因此目前不能声称已完成 vLLM 端到端训练，也不能把这次失败归因于 CacheEOPD loss 或
+KV 映射；更准确的阻塞是 apex-llm 当前 torch/Ray/FSDP/Qwen3 teacher 初始化组合的原生
+兼容性问题。正式 2048/4096 对照训练和评测尚未启动。
+
+本阶段同时更新了 `scripts/eopd/run_eopd_vllm.sh`：默认开启 TP4、2048+2048 总长度、
+`sdpa`、FlashInfer sampler workaround、on-policy advantage、teacher bf16/offload，
+并保留 `MAX_PROMPT`、`MAX_RESPONSE`、`MAX_MODEL_LEN`、`TRAIN_BATCH_SIZE` 等环境变量，
+可直接切换到 4096 总长度进行后续环境修复后的验证。
+
+补充验证：将 teacher 临时替换为同目录的 Qwen3-1.7B，保持 4 卡、2048 总长度、SDPA、
+FSDP1、bf16 和 offload 不变，仍在相同的 reference FSDP wrap 阶段 SIGSEGV。因此问题
+与 Qwen3-4B 的显存规模无关，也不是单纯 OOM；更可能是当前远端 torch/Ray/FSDP 组合在
+该 worker 初始化路径上的二进制或原生运行时兼容问题。该 1.7B 试验未进入训练 step，
+不产生任何实验结果。
+
+#### 阶段十五补充：修复 tokenizer 映射并完成 vLLM 端到端冒烟（2026-08-02）
+
+上一轮卡住的直接原因不是 teacher FSDP，而是 `verl/workers/actor/dp_actor.py` 中用于
+Soft-KD 调试日志的 tokenizer 代码：`ActorConfig` 本身没有 `model.path`，代码因此回退到
+硬编码的 `Qwen/Qwen3-1.7B-Base`，在离线机器上反复访问 Hugging Face。修复为由
+`FSDPWorker` 把已经按 `actor_rollout_ref.model.path` 离线加载的 tokenizer 显式传给
+actor/ref，移除隐式联网和错误 fallback；`dp_actor.py`、`fsdp_workers.py` 均通过环境
+Python 语法检查。
+
+随后重跑 4 卡（GPU 1,2,4,5）、TP1×DP4、Qwen3-0.6B student / Qwen3-4B teacher、
+GSM8K Parquet、prompt/response=256、总长度=512、batch=8、1 step 的 EOPD vLLM 冒烟，
+日志为 `logs/train_vllm_smoke2.log`。本次确认完整链路成功：
+
+- vLLM 从本地 student 路径启动，参数实际为 `max_model_len=512`、TP=1、
+  `max_new_tokens=256`，没有 Qwen3-1.7B-Base 或 Hugging Face 网络请求。
+- teacher Qwen3-4B 完成 FSDP 加载；`compute_ref_log_prob` 产出 teacher entropy/top-k
+  信息，`update_policy` 进入 EOPD clipped reverse-KL + entropy-gated Soft-KD。
+- 完成 optimizer update，日志出现 `training/global_step=1`、`soft_kd_loss=0.0607`、
+  `soft_kd_token_ratio=0.0840`、`grad_norm=50.75`；vLLM rollout 和独立 validation
+  也完成，单步吞吐约 18.23 token/s。
+
+这次 validation 只用于链路冒烟（response 上限 256 且仅训练 1 step），得到的
+`0.0083` 不具有实验比较意义。vLLM 仍需设置 `VLLM_USE_FLASHINFER_SAMPLER=0`；其余
+`Failed to import Triton kernels` 是 vLLM 环境 warning，不影响本次训练完成。下一步先用
+相同脚本将总长度提升到 2048，再评估显存和吞吐后决定是否运行 4096；正式 CacheEOPD 与
+官方 EOPD 对照仍必须使用相同长度、步数和 student-only 评测协议。
+
+### 阶段十五补充：2048 长度验证 + 4096 计划（2026-08-02，进行中）
+
+运行环境（apex-llm）：micromamba `ta_opd_faithful`
+（`/home/kejiechen/micromamba/envs/ta_opd_faithful/bin/python3`），
+`PYTHONPATH=/home/kejiechen/CacheEOPD`，GPU 1/2/4/5（GPU0 被别人占满），
+数据 `/home/kejiechen/data/gsm8k/train.parquet` + `test.parquet`，
+student `Qwen3-0.6B`、teacher `Qwen3-4B`，checkpoint 与 Ray 临时目录改到 `/dev/shm`
+（根文件系统 `/` 含 `/home`、`/tmp` 已 99% 满，仅 13G 余）。
+
+- **2048 验证**（MAX_PROMPT=1024 / MAX_RESPONSE=1024，total 2048，10 步，batch 8）：
+  vLLM `max_seq_len=2048` 正常启动、无 Hugging Face 联网，step1–9 全部正常完成。
+  代表性指标：soft_kd_loss 0.110→0.063、rev_kl 0.636→0.545、grad_norm 22.7→41.0、
+  throughput 48–63 tok/s、峰值显存聚合 ~23.4 GB（远未 OOM）。**结论：2048 总长度的
+  vLLM EOPD 链路可跑通、不 OOM、指标正常。** step10 在收尾阶段卡死（>10 min，GPU 仍
+  85% 但无新 step 日志）。
+  - 根因：根文件系统 99% 满，Ray object-spill 目录 `/tmp/ray/session_*` 无法扩展，
+    最后一步写大对象时阻塞；与之前多阶段 `/home` 满盘属同一类磁盘问题。
+  - 修复：后续运行设 `RAY_TMPDIR=/dev/shm/ray`（`/dev/shm` 余 228G），checkpoint 也写
+    `/dev/shm`；已清理陈旧的 ray session。
+- **4096 验证**（MAX_PROMPT=2048 / MAX_RESPONSE=2048，total 4096 = 论文 response 上限、
+  脚本默认）**已完成 10/10**：vLLM `max_seq_len=4096` 正常，10 步全部跑通、step10 正常
+  收尾（此前 2048 卡死的位置），`/tmp` 满盘告警 **0 次**（`RAY_TMPDIR=/dev/shm` 修复生效）。
+  代表性指标：soft_kd_loss 0.050→0.082、grad_norm 22.5→（稳定）、峰值显存聚合
+  **31.7 GB**（2048 时为 23.4 GB，符合 2× 序列预期，远未 OOM）、末尾 GSM8K val
+  `acc/mean@1 = 0.3139`（仅 10 步冒烟，无比较意义，但证明 val 链路可用）。总耗时 ~27 min /
+  10 步（~38s/步 起步，后段因 4096 响应更长变慢）。**结论：论文 4096 长度在共享机上可跑通、
+  不 OOM、指标正常，磁盘卡死问题已用 `/dev/shm` 解决。**
+
+待补：
+- [x] 4096 验证跑满 10 步并确认无 step 收尾卡死（`RAY_TMPDIR=/dev/shm` 生效）
+- [x] 确定正式对照长度（倾向 4096 = 论文口径；共享机吞吐不足则用缩短 pilot 并标注）
+- **官方 EOPD 300 步基线已启动（2026-08-02）**：按用户决定，先跑官方 EOPD（w/o C2C）
+  作为 control。配置：4096 总长度、batch 8、save_freq 50、checkpoint 与 Ray temp 全部
+  放在 `/dev/shm`（根文件系统满、且无任何持久可写大盘——`/ext0`/`/ext1`/`/mnt/tidalfs`
+  均 Permission denied，仅 `/home/kejiechen` 13G 可写但已满）。已确认 step1–4 正常、
+  ~37s/step、ETA ~3h、无早期 OOM、GSM8K val 每 50 步触发一次。
+  ⚠️ `/dev/shm` 是内存盘，机器重启/ OOM-kill 即丢失；需事后把 ckpt 拷到持久存储
+  （如 scp 回本地或共享盘）才能保留。CacheEOPD 侧仍待 `c2c_hf` 注入接入 vLLM 路径后再对照。
+  - **step50 里程碑（2026-08-02）**：已完成 step 50/300，GSM8K val `acc/mean@1 = 0.3086`
+    （30.86%，与 10 步冒烟的 0.3139 基本持平，符合 EOPD 早期平缓、随步数抬升的预期）；
+    checkpoint `global_step_50`（含 optimizer，3.4G）已落本地 `_backups/eopd_baseline_300/`
+    （rsync 保险验证可用；中途曾因 rsync 周期比 ckpt 写入早 2 分钟而显示空，强制补传后正常）。
+    运行健康，~37s/step，ETA 含 6 次 val 约 4–5h。
+## 阶段十六：模型配置纠偏——回到论文口径 1.7B-Base + 8B（2026-08-02）
+
+**问题**：上述 300 步「官方 EOPD 基线」用的是 **Qwen3-0.6B 学生 + Qwen3-4B 教师**，
+这是照抄阶段十五 smoke2 冒烟配置的结果，**并非 EOPD 论文口径**。经用户指出后核对
+`Baselines/EOPD/EOPD复现.md`，论文 Table 2 那一行是 **Qwen3-1.7B-Base + Qwen3-8B**。
+
+**该次错误配置的运行结果（作废，仅留存为负面记录）**：跑到 step 167/300 后终止。
+GSM8K val **单调下降**：step50 = 0.3086 → step100 = 0.2669 → step150 = 0.2654。
+`soft_kd_token_ratio ≈ 0.18`，即 **82% 的 token 走纯 PG 而非 KL 蒸馏**，蒸馏信号很弱，
+叠加学生模型过小，acc 下降不意外。ckpt（step 50/100/150，共 11G）已备份到本地
+`_backups/eopd_baseline_300/`。
+
+**与官方口径的全部偏差（已修正）**：
+
+| 项 | 官方 EOPD | 错误运行 | 现状 |
+|---|---|---|---|
+| 学生 | Qwen3-1.7B-Base | Qwen3-0.6B | 已下载 1.7B-Base |
+| 教师 | Qwen3-8B | Qwen3-4B | 已下载 8B |
+| `ref.topk_logits` | 16 | 32 | 脚本已参数化，默认改 16 |
+| batch / mini-batch | 128 / 32 | 8 / 8 | 脚本已拆出 `MINI_BATCH_SIZE` |
+| 训练数据 | MATH | GSM8K | 机器上已有 `/home/kejiechen/data/math`（7500 条） |
+| τ / α | 0.8 / 1.0 | 0.8 / 1.0 | ✓ 本来就对 |
+
+**环境准备**：
+- `/home` 原仅剩 13G。经用户确认删除 pip 缓存 7.8G + `outputs/slime_opd` 5.0G +
+  `Qwen3-1.7B`(Instruct) 3.8G + `Qwen3-1.7B_torch_dist` 3.3G，腾到 33G。
+  保留 `ckpt_eopd_dense` 6.8G 与 dapo-math 数据集 2.0G。
+- 模型经 `HF_ENDPOINT=https://hf-mirror.com` + `hf download` 拉取（apex 直连 HF 不通，
+  hf-mirror 可用、modelscope API 404）：
+  - `Qwen3-1.7B-Base` 3.3G，单文件 `model.safetensors`（无 index），
+    `eos=151643`、`do_sample=false`、`max_pos=32768` → 确认是**真 Base 版**
+    （对比 Instruct 版 `eos=151645`、`max_pos=40960`）。
+  - `Qwen3-8B` 16G，5 分片，36 层 / hidden 4096 / kv_heads 8。
+  - 下载后 `/home` 剩 14G。
+- ⚠️ 机器上**没有** README 提到的官方 `eopd-baseline` 仓库（`/home/kejiechen/eopd-baseline`
+  不存在）和 `eopd` conda 环境（只有 `ta_opd_faithful`）。因此仍走本地
+  `CacheEOPD/verl` + `scripts/eopd/run_eopd_vllm.sh`，靠参数对齐论文口径。
+
+**脚本改动**（`scripts/eopd/run_eopd_vllm.sh`，本地与远程已同步）：
+新增 `MINI_BATCH_SIZE`（默认 = TRAIN_BATCH_SIZE）、`TOPK_LOGITS`（默认 16）、
+`ENTROPY_THRESHOLD`（默认 0.8）、`SOFT_KD_COEF`（默认 1.0）四个可调环境变量，
+把原先硬编码的 topk=32 改为默认 16。
+
+**1.7B-Base + 8B 两步冒烟结果（2026-08-02，已完成 2/2）**
+配置：MATH 数据、1024+1024、batch 8、`GPU_MEMORY_UTILIZATION=0.25`、4 卡（GPU1/2/4/5）。
+
+| 指标 | 值 | 说明 |
+|---|---|---|
+| 是否 OOM | **否** | 峰值显存 21.2 → 22.8 GB / 48GB，余量充足 |
+| step 1 耗时 | **54 s** | 训练本身很快 |
+| 2 步总耗时 | 1:12:04 | ⚠️ 绝大部分是**末步 validation**（MATH test **5000 题** × 1024 token），非训练开销 |
+| `soft_kd_token_ratio` | **0.2257** | 8B 教师（对比 4B 教师的 0.18） |
+| `soft_kd_avg_kl` | **0.9466** | 4B 教师时为 0.4575，**KL 强度翻倍** |
+| `ref_entropy` | mean 0.5913 / max 2.694 | 单批 `entropy>1.0` 达 **978/2048（47.8%）**，另批 846/2048 |
+
+**结论**：
+1. **显存和吞吐都不是瓶颈**（22.8G/48G，54s/step）。
+2. **教师换 8B 后蒸馏信号显著增强**：`avg_kl` 0.458 → 0.947（翻倍），高熵 token 比例
+   0.18 → 0.23。这正面印证了先前 0.6B+4B 跑出 acc 单调下降的一个重要成因是
+   **蒸馏信号过弱**（82% token 退化为纯 PG）。
+3. ⚠️ **validation 开销必须控制**：MATH test 全量 5000 题跑一次约 1 小时。正式 300 步
+   若每 50 步 val 一次（6 次）将额外耗掉 ~6h。**正式运行前需把 val 子采样**
+   （如取 500 题）或拉长 `test_freq`。
+
+冒烟后已 `pkill` + `ray stop`，GPU1-5 全部释放。
+
+---
+
+## 阶段十七：C2C projector（1.7B-Base + 8B）预训练——调研完成，**暂缓执行**（2026-08-02）
+
+按用户指示「先别跑，存 PROGRESS」，本节仅记录调研结论，**未启动任何训练**。
+
+### 训练入口与配置
+
+- **入口**：`Baselines/C2C/script/train/SFT_train.py`（全仓库唯一能产出
+  `final/projector_0..27.pt` + `projector_N.json` 这种 rosetta 格式的脚本）。
+  启动方式见 `Baselines/C2C/bash/train/sft_train.sh:12-24`：
+  ```
+  torchrun --nproc_per_node=N --master_port=29501 \
+      script/train/SFT_train.py --config recipe/train_recipe/C2C_1.7+8.json
+  ```
+  CLI 参数极少（`SFT_train.py:871-875`），一切靠 config JSON；
+  注意 `--output_dir` **无效**，会被 config 里的 `output.output_dir` 覆盖（`:895`）。
+- ⚠️ **不要混用** `cache_eopd/train_projector.py`——那是自研线（CE/SFT 口径，产出
+  `projector_final.pt` + `.weights`），**不产出 rosetta 格式**。
+- **配置模板**：`Baselines/C2C/recipe/train_recipe/C2C_0.6+0.5.json`
+  （机器上那份 `qwen3_0.6b+qwen3_4b_base_Fuser/config.json` 即由它派生）。
+  改 4 处即可：`model.base_model` → `Qwen3-1.7B-Base`、`model.teacher_model` → `Qwen3-8B`、
+  `output.output_dir`、`projector.params.anneal_steps`（须 ≈ total_steps，
+  见 `SFT_train.py:1159-1161`；0.6+0.5 用 1929、0.6+4b 用 1953）。
+
+### 关键结论：projector 张量形状与 0.6B+4B **完全一致**
+
+`SFT_train.py:602-607` 显示维度是**全自动推导**，且投影的是 **per-head KV 维度**而非
+hidden_dim：
+```python
+602: base_dim    = k_proj.out_features / base_model.config.num_key_value_heads
+603: teacher_dim = k_proj.out_features / teacher_model.config.num_key_value_heads
+618: num_projectors = slm_num_layers   # = 学生层数 28
+```
+Qwen3 全系 `head_dim=128, kv_heads=8`，所以 4B→8B 换教师后 `teacher_dim` 仍是 128，
+0.6B→1.7B 换学生后 `base_dim` 仍是 128。**config 里 `hidden_dim`/`intermediate_dim`=1024
+原封不动即可**，变的只是教师隐层语义，接口不变。
+
+层映射 `mapping="last_aligned"` → `rosetta/train/model_utils.py:97-150` 的
+`last_aligned_sources(28, 36, K=1)`：`offset = 36-28 = 8`，学生层 t ← 教师层 `8+t`
+（`model_utils.py:134`）。与 0.6B+4B 时同为 28↔36，**映射行为完全相同**。
+（`SFT_train.py:418` 的 `build_layer_mapping` 是遗留死代码，未被调用。）
+
+### 三个已知坑的当前代码状态
+
+| 坑 | 位置 | 状态 |
+|---|---|---|
+| KL reduction 量纲 | — | ✅ 官方路径不受影响（`SFT_train.py` 用 CE，无 KL）。⚠️ 但 `cache_eopd/eval_projector_kl.py:30` 仍 `from cache_eopd.train_projector import token_mean_kl`，该函数已删 → **该脚本现在 import 即崩** |
+| save_projector 不存权重 | `rosetta/model/projector.py:1513-1523` 只序列化 `_init_args` 成 JSON | ✅ 官方训练脚本已规避：`SFT_train.py:1447-1449` 先 `torch.save(state_dict)` 再写 `.json` |
+| **gate 默认关闭** | `rosetta/model/projector.py:1374-1375` `key/value_gate_logit = Parameter(0.0)`；推理硬门控 `:1479-1480` `(gate_logit > 0).float()` | ❌ **上游未修**。logit==0 判 False → **融合全关，静默失败**。训练期靠 Gumbel 噪声（`:1468-1476`）让梯度能流，需足够步数把 logit 推正；**短跑必翻车** |
+
+### 执行前必须先决策的三件事
+
+1. **语料规模**：官方 500k / 1929 步是 **0.5B 教师**的配方；换 8B 教师后单步开销高一个
+   量级。需决定 50k（~200 步，先验证链路）/ 150k（~600 步）/ 500k（严格对齐）。
+2. **gate 初值**：是否把 `projector.py:1374-1375` 的 0.0 改成正值（如 1.0），
+   或沿用自研线的 `--gate-init 1.0 + --gate-lr-mult 20.0`（`train_projector.py:98-109`）。
+   不改则需在训练后检查有多少层 `gate_logit > 0`。
+3. **语料存放**：`rosetta/train/dataset_adapters.py:1404` **硬编码**
+   `load_dataset("teknium/OpenHermes-2.5")`，**无 `data_path` 参数**，只能靠
+   `HF_HOME`/`HF_ENDPOINT`。数据集约 1.6G，`/home` 现剩 14G。
+   （若要用本地数据须改走 `LLMGeneratedChatDataset`，`dataset_adapters.py:1170`，
+   它接受 `kwargs.data_path`，模板见 `recipe/train_recipe/include_response.json:56-64`。）
+
+### 其他注意事项
+
+- 服务器上**有** `/home/kejiechen/CacheEOPD/rosetta` 库，但**没有 `SFT_train.py`**，
+  执行前需从本地 `Baselines/C2C/` scp 过去。
+- `dataset_adapters.py:1427` 的长度过滤器硬编码用 `Qwen/Qwen3-0.6B` 的 tokenizer 计数；
+  Qwen3 同族词表相同，1.7B-Base 下无影响，但仍需能下到该 tokenizer。
+- 产物目录里是 `projector_config.json`（`SFT_train.py:1449`），而非 HF 发布版的
+  `aggregator_config.json`——本仓库无代码生成后者，下游加载器需对应。
+
+- [ ] **关键缺口**：CacheEOPD 的 `c2c_hf` teacher-KV 注入目前是 HF rollout，尚未接入本
+    vLLM EOPD 路径。正式 CacheEOPD vs 官方 EOPD 对照前，需先实现「vLLM rollout 注入
+    teacher KV」或改走「HF rollout + EOPD loss」的等价入口；两者必须同长度/步数/
+    student-only 评测协议，否则不可比。
+- [ ] 正式对照：官方 EOPD（w/o C2C）vs CacheEOPD（w/ C2C），300 步，6 基准 student-only 评测。
+- [ ] **C2C projector 配对缺口**：现有 fuser 只有 `qwen3_0.6b+qwen3_4b_base_Fuser` 一对
+  （config 写死 `base_model=Qwen3-0.6B` / `teacher_model=Qwen3-4B-Base`，28 层 projector
+  各 37MB）。改用 1.7B-Base + 8B 后，CacheEOPD 实验臂**没有可用 projector，必须重新
+  预训练**（OpenHermes500k 语料）。注意已知三陷阱：KL reduction 量纲、`save_projector`
+  不存权重、gate 默认关闭——三者都是静默失败。
+
+---
+
+## 0804 后续研究路线：从随机注入到自主选择
+
+### 当前判断
+
+已有 mixed 结果说明：训练时随机注入 Teacher KV 可能提高早期收敛效率，最终独立评测
+通常有约 0.5--2% 的局部收益。但当前证据还不能说明学生学会了自主判断何时需要 Teacher
+KV，也不能确认最终能力上限稳定提升。
+
+当前 `train_student_distill.py` 中的 mixed 是 **micro-batch 级别随机选择**：每个
+micro-batch 以固定概率使用 Teacher KV 或 Student KV（见 `:367`）。该脚本使用预先生成的
+teacher trajectory 做 response CE，尚未让学生自主生成不同 trajectory，也没有根据最终
+reward 计算 fuse 策略的 advantage。因此，后续 trajectory-level / advantage 实验应以
+`train_eopd_hf.py` 的 on-policy EOPD 逻辑为基础；其中已有 student rollout、teacher
+signals 和 `advantage = teacher_log_probs - old_log_probs`（见 `:159`）。
+
+### 第一阶段：巩固 mixed 的结论
+
+在扩大模型前，固定数据、训练步数、评测集和 checkpoint 间隔，至少运行以下多 seed 对照：
+
+```text
+plain / EOPD / mixed(p=0.25) / mixed(p=0.5) / mixed(p=0.75) / anneal
+```
+
+每个 seed 在 step 50、100、150、200、250、300 保存，并使用 student-only、无 Teacher
+KV、无 projector 的独立评测。记录：
+
+- 固定 step 的均值、标准差和 paired seed 差值；
+- 最佳 checkpoint 的均值，而不是只报告单个最佳 seed；
+- 达到指定准确率所需的 step（time-to-threshold）；
+- 50--300 步准确率曲线下面积（AUC）；
+- 题目级别的 plain 正确、fused 正确、plain 正确但 fused 错误。
+
+只有在多 seed 的均值和 paired 差值稳定为正时，才能把结论表述为“提升”；否则应表述为
+“可能改善收敛速度或改变最佳 checkpoint 区间”。
+
+### 第二阶段：coverage / hit ratio 分析
+
+coverage 不能只统计预设的 `fused_prob`，因为该数值本身就是实验设定。应同时记录：
+
+1. **injection rate**：实际使用 Teacher KV 的 micro-batch 数占比；
+2. **active KV ratio**：layer-token-head 中实际产生有效 projector 增量的比例；
+3. **beneficial hit ratio**：同一题目上，fused 相比 plain 从错变对或降低 next-token CE
+   的比例；
+4. **harmful hit ratio**：plain 正确而 fused 错误，或 fused 提高 CE 的比例。
+
+需要按题目、token 位置、student layer、KV head 以及 teacher/student divergence 分组，
+观察 Teacher KV 是否只在少数题目或少数 token 上有效。`C2CProjector` 已经计算了每个
+token/head 的 scalar 权重，但全局 key/value gate 仍是 layer 级标量（见
+`rosetta/model/projector.py:1464`）；当前只保存最后一次 forward 的诊断值，因此需要新增
+逐层聚合日志或单独的 coverage 分析脚本。
+
+### 第三阶段：trajectory-level fuse + advantage
+
+对同一个 prompt 让当前 student 产生多个候选 trajectory：
+
+```text
+A：完全不使用 Teacher KV
+B：使用 Teacher KV
+C：只使用部分 Teacher KV
+```
+
+对同一题目比较最终 reward 或 EOPD token-level signal，计算：
+
+```text
+advantage(strategy) = reward(strategy) - same-prompt baseline reward
+```
+
+第一版建议先实现 trajectory-level bandit，不要立即训练复杂的 token selector：
+
+- fused trajectory 的 advantage 为正时，提高该类题目使用 fused 的概率；
+- advantage 为负时，降低使用概率；
+- 使用同一 prompt、相同评测规则和 paired rollout，减少题目难度与采样噪声影响。
+
+该实验要回答的问题是：学生能否学会判断“这道题是否需要老师帮助”，而不仅是随机接受
+老师帮助。评测阶段仍然必须完全移除 Teacher KV 和 projector。
+
+### 第四阶段：token importance 反事实探针
+
+不要一开始就直接训练 token selector，先离线比较每个 token 的三种重要性：
+
+1. **representation divergence**
+
+   `D_t = ||projected_teacher_KV_t - student_KV_t||`
+
+   表示 Teacher 与 Student 的状态差异，但不代表注入一定有益。
+
+2. **当前 token 信息收益**
+
+   `G_t = CE_plain(t) - CE_fused(t)`
+
+   大于零表示 Teacher KV 降低了当前 token 的预测损失。
+
+3. **forward-looking effect**
+
+   `F_t = sum_{u=t}^{t+H}(CE_plain(u) - CE_fused(u))`
+
+   衡量某个 token 的注入是否改善后续多个 token，而不只是当前一步。
+
+需要比较 `D_t`、`G_t`、`F_t` 与最终答题正确率的相关性，从而验证“有方向的 divergence”、
+“information loss 更少”和“forward-looking effect”哪个比单纯 KV L2 距离更有价值。
+
+### 第五阶段：selective KV 训练
+
+在反事实探针确认有效指标后，再在 `fused_kv.py` 中加入 token-level fusion mask，使每个
+prefix token 可以选择：
+
+```text
+靠近 Teacher / 保持 Student 自主状态 / 抑制 Teacher 信号
+```
+
+训练初期使用 soft mask，后期再逐渐变为 hard selection。selector 的监督信号应来自
+反事实 reward 或 forward-looking gain，并对标签计算停止梯度，避免 selector 通过改变
+评分方式作弊。可选目标为：
+
+```text
+L = L_EOPD + λ1 * L_selective_KD + λ2 * L_sparsity
+```
+
+推荐新增或修改的文件：
+
+- `cache_eopd/train_eopd_hf.py`：作为 on-policy trajectory / advantage 基础；
+- `cache_eopd/fused_kv.py`：增加 token-level mask、KV delta 和诊断输出；
+- `cache_eopd/probe_token_importance.py`：离线计算 D_t、G_t、F_t；
+- `cache_eopd/coverage.py`：汇总 injection、beneficial hit 和 harmful hit；
+- `cache_eopd/train_cache_policy.py`：训练 trajectory-level 或 token-level selector。
+
+### 推荐执行顺序
+
+```text
+多 seed 复现
+→ coverage / beneficial hit 分析
+→ trajectory-level advantage 选择
+→ token-level 反事实 importance
+→ selective KV 训练
+→ 更大模型和更大数据实验
+```
+
+最终阶段性目标不是证明“Teacher KV 越多越好”，而是证明：Teacher KV 只在特定题目、
+特定 token 或特定状态下有益，并且学生可以通过 advantage 学会主动请求或拒绝这部分帮助。
+
+### 阶段十九：官方 projector 多 seed 对照启动（2026-08-04，进行中）
+
+用户要求验证第一阶段结论：固定三组 seed，比较 plain、EOPD、mixed，并比较 anneal 的
+线性、二次和根号调度。为避免 prior-v7 projector 成为变量，本轮统一使用官方
+`qwen3_0.6b+qwen3_4b_base_Fuser/final`，对应 Qwen3-0.6B student → Qwen3-4B teacher。
+
+固定配置：
+
+```text
+seeds = 41717, 41718, 41719
+steps = 300；checkpoint = 每 50 步
+plain / EOPD / mixed(p=0.5)
+anneal: linear / quadratic / sqrt，Teacher KV 概率 1.0 -> 0.0
+student-only 独立评测：GSM8K test 前 500 题，max_new_tokens=512
+```
+
+调度定义为概率插值进度 `f(s)`：linear=`s`、quadratic=`s²`、sqrt=`sqrt(s)`，其中
+`s=step/300`。因此 quadratic 在前期保留 Teacher KV 更久，sqrt 在前期更快撤掉 Teacher
+KV。训练入口新增 `--anneal-schedule {linear,quadratic,sqrt}`。
+
+本轮采用已有 1368 条 GSM8K teacher trajectory 训练，holdout 前 64 条不训练；plain、
+mixed、anneal 共用同一数据和 student-only 评测口径。EOPD 使用当前 HF EOPD runner 的
+on-policy loss（clipped policy-gradient + entropy-gated top-16 soft-KD），同样训练 300
+steps、每 50 步保存。
+
+500 题评测集为 `/home/kejiechen/CacheEOPD/data/gsm8k_cot_test_500.jsonl`，由缓存的
+GSM8K test split 固定取前 500 题生成。完整 checkpoint 暂存于：
+`/dev/shm/cacheeopd/multiseed_official_20260804`；日志和逐 checkpoint 评测结果保存于：
+`/home/kejiechen/CacheEOPD/logs/multiseed_official_20260804`。批量启动器为
+`cache_eopd/run_multiseed_official.sh`。
+
+本轮启动前，官方 Qwen3-1.7B→8B EOPD 基线在 step200 被用户主动停止。为保证以后可恢复，
+已将其完整 step200（模型、optimizer、extra state、环境导出、原始启动命令和数据校验）
+持久化到 `/home/kejiechen/CacheEOPD/persistent/eopd_1p7_8b_300_step200`。恢复时使用：
+
+```text
+trainer.resume_mode=resume_path
+trainer.resume_from_path=/home/kejiechen/CacheEOPD/persistent/eopd_1p7_8b_300_step200
+```
+
+当前状态：批量 runner PID `3187582` 已启动，正在运行 `plain seed=41717`，训练已正常到
+step40，尚未出现 OOM；结果完成后继续追加三 seed 均值、标准差、time-to-threshold、AUC
+以及各 checkpoint 的 500 题准确率。
+
+### 阶段二十：vLLM V1 融合接入第一阶段（2026-08-04，代码已写，远端冒烟待恢复）
+
+本阶段开始把此前只在 HF `past_key_values` 上验证的 C2C 融合迁移到 vLLM。关键约束是：
+vLLM 的公开生成接口只接收 token ids/embeddings，不能把 HF `DynamicCache` 直接塞进
+`SamplingParams`；而且如果先让 vLLM 做普通 prefill，再写回 KV，prefill 已经覆盖了注入
+内容，首个 response token 也可能已经采样。因此第一版采用 vLLM V1 KV-transfer 的正确顺序：
+
+```text
+HF teacher/student + C2C projector
+    → student-shaped fused KV packet
+    → request extra_args.kv_transfer_params
+    → scheduler 把前 L-1 个 prompt token 标记为已计算
+    → connector 写入前 L-1 个 paged KV blocks
+    → vLLM 计算最后一个 prompt token，再从 fused prompt KV decode
+```
+
+新增代码：
+
+- `cache_eopd/vllm_kv_packet.py`：把 `FusedKVBuilder.build()` 的 `DynamicCache` 转成单请求
+  packet，保存输入 token、prompt 长度、逐层 key/value，并提供 `build_packet_from_models()`。
+- `cache_eopd/prepare_vllm_kv_packet.py`：独立 CLI，可加载官方 fuser 或本项目 projector，
+  生成 packet 并打印 JSON request metadata。
+- `cache_eopd/vllm_kv_connector.py`：vLLM V1 `KVConnectorBase_V1` 实现。scheduler 侧报告
+  packet 覆盖的前 `L-1` 个 prompt token 数，worker 侧按 block id 和 block offset 把
+  `[num_kv_heads, prompt_len, head_dim]` 写入 vLLM 的
+  `[2, num_blocks, block_size, num_kv_heads, head_dim]` cache layout。
+- `verl/workers/rollout/vllm_rollout/vllm_async_server.py`：启用 `rollout.c2c` 时配置
+  connector，传递 `SamplingParams.extra_args.kv_transfer_params`，并在 packet 缺失时硬失败。
+- `verl/trainer/config/rollout/rollout.yaml`：加入 vLLM C2C 配置默认值。
+- `cache_eopd/smoke_test_vllm_connector.py`：不启动模型的 CPU 冒烟，验证 block offset、
+  层排序、`L-1` 注入边界和 token hash。
+- `cache_eopd/smoke_test_vllm_engine.py`：真实 vLLM engine smoke，支持 self-KV 或外部
+  teacher-projector packet。
+
+这一阶段还没有宣称端到端 EOPD 已完成：packet 目前由独立入口生成，尚未自动绑定每轮
+EOPD 的 student 权重同步和 rollout request。这样可以先独立验证 vLLM 的 block 映射和
+首 token 逻辑，再接入在线 provider；在此之前不会把普通 vLLM 结果冒充融合结果。
+
+本地静态检查已通过：5 个新增/修改 Python 文件 AST 解析通过，`run_eopd_vllm.sh` 通过
+`bash -n`，`git diff --check` 通过。当前环境没有安装 torch，无法在本地执行 tensor smoke；
+本轮多次尝试连接 `apex-llm` 均在 SSH 握手阶段被关闭，因此 vLLM 0.13 的真实 import、
+connector factory 注册和 GPU paged-cache smoke 尚未执行，恢复 SSH 后优先运行
+`PYTHONPATH=. python -m cache_eopd.smoke_test_vllm_connector`，再做单请求 vLLM decode。
+
+远端验证更新（2026-08-04 17:51）：SSH 已恢复。`apex-llm` 的 vLLM 版本确认为 0.13.0，
+`CacheEOPDConnector` 在真实 vLLM 环境中 import 成功，`__abstractmethods__` 为空；通过
+`KVConnectorFactory._get_connector_class_with_compat()` 动态加载成功，CLI JSON 也能解析为
+`KVTransferConfig(kv_connector=CacheEOPDConnector, kv_role=kv_both)`。远端执行
+`PYTHONPATH=. python -m cache_eopd.smoke_test_vllm_connector` 输出 `VLLM_CONNECTOR_OK`，
+并完成远端 `py_compile`。
+
+根据 vLLM 官方 `ExampleConnector` 接口又修正了三点：`get_num_new_matched_tokens` 返回
+`(tokens, False)`；外部 token 数向 block size 向下对齐；metadata 继承
+`KVConnectorMetadata`，connector 构造接收 `kv_cache_config`。因此 prompt 长度为 `L` 时，
+当前首版实际注入 `floor((L-1)/block_size)*block_size` 个 KV，剩余尾部由 vLLM student
+正常 prefill，避免错误的首 token logits。GPU engine 尚未启动，原因是当前 GPU0 已被 vLLM
+服务占用、GPU1/2/4/5 仍有其他实验任务；下一步使用空闲 GPU 做单请求 engine smoke。
+
+GPU engine smoke 更新（2026-08-04 17:56）：使用 GPU1 和 Qwen3-0.6B 做了真实 vLLM
+端到端单请求测试。脚本先用 HF student 生成 self-KV packet，再启动 vLLM 0.13.0，
+通过 `KVTransferConfig` 加载 `CacheEOPDConnector`，请求携带
+`SamplingParams.extra_args.kv_transfer_params`，最终输出 `VLLM_ENGINE_OK`。日志确认
+factory 创建 connector、KV cache 初始化完成且请求成功生成；测试进程已退出，GPU1 显存
+恢复到约 2.4GB。由此证明 vLLM scheduler → connector metadata → paged KV → decode
+的第一阶段链路已真实跑通。该 smoke 使用 self-KV 只验证传输/映射，不代表 teacher/projector
+融合效果；下一阶段仍需把每轮 EOPD student 权重下的 teacher+projector packet 自动生成
+接入 rollout request。
+
+随后使用官方 Qwen3-0.6B→Qwen3-4B fuser 在 GPU1 生成真实 fused packet：28 层，prompt
+长度 10，单层 KV 形状 `(8, 10, 128)`。将该 packet 直接交给 Qwen3-0.6B 的 vLLM 0.13.0
+engine 后同样输出 `VLLM_ENGINE_OK`。这一步确认的已经是 teacher→official projector→packet
+→vLLM paged cache→decode 链路；但仍是单请求静态 packet，尚未证明 EOPD 每轮更新 student
+权重后能自动、低开销地在线生成 packet。
+
+### 阶段二十一：mixed probability ablation（2026-08-04 21:16--22:57，已完成）
+
+用户要求暂不完成 seed41719，并在已经完成的 seed41717/41718 上补做 mixed 的两档融合
+概率。原多 seed 调度器在收到请求前已经于 21:06:59 启动了 seed41719 的 plain、EOPD、
+mixed-0.5 和 anneal-linear；已核对 PID 后仅终止这四个 seed41719 任务及其调度器，未触碰
+其他用户进程或已完成结果，也阻止了后续 seed41719 的 quadratic/sqrt 启动。
+
+新的独立 runner：`cache_eopd/run_mixed_prob_ablation.sh`。四个任务于 21:16:52 并行启动：
+
+```text
+GPU1: mixed p=0.25, seed41717
+GPU2: mixed p=0.75, seed41717
+GPU4: mixed p=0.25, seed41718
+GPU5: mixed p=0.75, seed41718
+```
+
+每个任务训练 300 steps，每 50 steps 保存 checkpoint，并在同一 GPU 上对固定 500 题做
+student-only 独立评测。结果目录为 `/dev/shm/cacheeopd/mixed_prob_ablation_20260804`，
+日志目录为 `/home/kejiechen/CacheEOPD/logs/mixed_prob_ablation_20260804`；启动时四项状态
+均已写入 `status.tsv`。seed41719 当前没有残留进程。
+
+本轮最终状态：四个任务均于 22:50--22:57 完成，24 个 checkpoint 均通过固定 500 题
+student-only 独立评测；GPU1/2/4/5 已释放。两 seed 的准确率（seed41717 / seed41718）如下：
+
+| step | mixed p=0.25 | mixed p=0.75 |
+|---:|---:|---:|
+| 50  | 332/500 (66.4%) / 329/500 (65.8%) | 318/500 (63.6%) / 324/500 (64.8%) |
+| 100 | 333/500 (66.6%) / 326/500 (65.2%) | 329/500 (65.8%) / 313/500 (62.6%) |
+| 150 | 309/500 (61.8%) / 327/500 (65.4%) | 334/500 (66.8%) / 308/500 (61.6%) |
+| 200 | 328/500 (65.6%) / 332/500 (66.4%) | 313/500 (62.6%) / 325/500 (65.0%) |
+| 250 | 329/500 (65.8%) / 333/500 (66.6%) | 334/500 (66.8%) / 321/500 (64.2%) |
+| 300 | 323/500 (64.6%) / 326/500 (65.2%) | 301/500 (60.2%) / 314/500 (62.8%) |
+
+按两 seed 平均，p=0.25 在 step50/100/150/200/250/300 分别为
+66.1%/65.9%/63.6%/66.0%/66.2%/64.9%；p=0.75 分别为
+64.2%/64.2%/64.2%/63.8%/65.5%/61.5%。此前 p=0.5 的对应平均为
+66.5%/64.3%/64.4%/65.9%/65.7%/64.8%。因此 p=0.25 整体最接近且在 step250
+略高于 p=0.5，但没有超过 p=0.5 的最佳 step50；p=0.75 明显更不稳定，step300
+下降尤其明显。当前证据支持继续优先研究中低概率 mixed，而不支持高概率 p=0.75。
+
+### 阶段二十二：CacheEOPD 三策略同口径复现实验（2026-08-04 23:21，已停止并作废）
+
+用户要求在 seed41719 统一实验前，先对已完成的 seed41717/41718 做纯 CacheEOPD、
+mixed 和 anneal 三种策略的同条件对照。三种策略均使用官方 Qwen3-0.6B→Qwen3-4B
+projector、同一 1304 条 teacher trajectory、学生 Qwen3-0.6B、300 steps、grad accumulation
+8、学习率 1e-5、每 50 steps 保存，并对同一固定 500 题做 student-only 独立评测：
+
+- `fused`：每个训练 microbatch 都注入 teacher KV；
+- `mixed`：`fused_prob=0.5`；
+- `anneal`：线性从注入概率 1.0 退火到 0.0，退火 300 steps。
+
+10 步冒烟已全部通过：fused、mixed、linear anneal 均完成 step1--10，holdout plain CE
+有限且正常保存 step5/10。最初 smoke 暴露的是 runner 中旧的 fuser 路径错误，已改用
+kejiechen 工作区实际存在的官方 fuser；未修改 knhdu 或 yuanxigu 的内容。
+
+曾启动 runner `cache_eopd/run_cacheeopd_three_methods.sh`，但在正式训练开始后立即停止：
+
+```text
+GPU1: fused seed41717    GPU2: mixed p=0.5 seed41717
+GPU4: anneal linear seed41717    GPU5: fused seed41718
+```
+
+该 runner 实际调用的是 `train_student_distill.py`，属于离线 teacher trajectory 的学生 CE，
+并没有 student on-policy rollout、teacher log-prob/entropy 检测和 EOPD clipped reverse-KL
++ entropy-gated top-k forward-KL。因此这批任务不符合本实验定义，已终止且不计入结果；没有
+保留或使用其中的 checkpoint。seed41719 仍未启动。
+
+### 阶段二十三：EOPD+C2C 正确训练入口（2026-08-05，开发中）
+
+新增 `cache_eopd/train_eopd_cacheeopd_hf.py`：以 `train_eopd_hf.py` 的 EOPD loss 为基线，
+仅替换 rollout：fused 分支先对同一 student prompt 做 teacher/student prefix forward，
+经官方 projector 融合成 student 维度 KV，再由 student 进行采样 rollout；并记录该 fused
+行为策略的 old log-prob。随后 teacher 对 student 生成的完整 sequence 计算 log-prob、entropy
+和 top-k 分布，使用原 EOPD 的 clipped reverse-KL policy-gradient 与 entropy-gated top-k
+forward-KL 更新 student。mixed 以概率决定每个 rollout 是否注入，linear anneal 使概率从
+1.0 退火到 0.0；三者只改变 rollout 引导，不改变 EOPD 检测与 loss。
+
+正确 smoke 结果：fused、mixed、linear anneal 均完成 3 steps；fused 日志每步均为
+`fused_rollout=true`，mixed 在概率 0.5 下出现 fused/non-fused 两类 rollout，anneal 的
+概率记录为 `1.0 → 0.667 → 0.333`。三者均产生非零 `pg_loss`、`soft_kd_loss`、teacher
+entropy 和 `soft_kd_token_ratio`，证明 C2C rollout 与 EOPD loss 已接通。
+
+正式 runner `cache_eopd/run_correct_eopd_cacheeopd.sh` 已于 2026-08-05 00:55:51 启动：
+两 seed 均测试 fused、mixed p=0.5、linear anneal，300 steps，EOPD 参数为 max response
+384、lr=1e-6、top-k=16、entropy threshold=0.8、soft-KD coef=1.0、每 50 步保存；全部
+checkpoint 使用固定 500 题 student-only 评测。第一波 GPU1/2/4/5 分别运行
+fused-41717、mixed-41717、anneal-41717、fused-41718；第一波结束后 GPU1/2 运行
+mixed-41718、anneal-41718。seed41719 仍未启动。
+
+用户已授权自动完成后续流程。已预置并同步 `cache_eopd/watch_and_run_seed41719.sh`，它等待
+本阶段 status 出现 `finished_at` 后自动启动 `run_seed41719_all.sh`。seed41719 的全套条件为
+plain SFT、原始 EOPD、CacheEOPD fused、CacheEOPD mixed p=0.5、CacheEOPD linear anneal，
+均为 300 steps、每 50 步保存、固定 500 题 student-only 评测；当前 watcher 已启动但尚未
+触发，避免与当前两 seed 任务竞争 GPU。
+
+进度更新（2026-08-05 09:10）：正确 EOPD+C2C 训练的其余 30 个 500 题独立评测文件已完成。
+当前可用结果如下（列顺序为 step50/100/150/200/250/300）：
+
+| strategy | seed41717 | seed41718 |
+|---|---:|---:|
+| fused | 306/318/305/314/313/312 | 299/308/312/305/297/314 |
+| mixed p=0.5 | 306/307/303/306/319/321 | 304/311/320/317/314/313 |
+| linear anneal | 303/300/311/309/318/309 | 待修复 |
+
+每项分母均为 500。两 seed 中 fused 的平均准确率序列为
+60.5%/62.6%/61.7%/61.9%/61.0%/62.6%，mixed p=0.5 的平均序列为
+61.0%/61.8%/62.3%/62.3%/63.3%/63.4%。anneal seed41718 已完成训练到 step300，
+但保存最终 checkpoint 时遇到 `/dev/shm` 磁盘满，未产生可评测的 step300 文件；现已清理
+我方旧 smoke/作废 checkpoint，repair 任务从头重跑，目前约 step10。seed41719 的第一次
+自动启动因 runner 局部变量 bug 和磁盘满失败，状态已备份；修复后将在 anneal41718 repair
+和评测结束后重新启动，不计入当前结果。
+当前与原始 EOPD 的同 500 题对照（EOPD 两 seed 平均）为
+62.0%/63.1%/62.5%/61.8%/64.2%/64.2%。因此 fused 的对应平均
+60.5%/62.6%/61.7%/61.9%/61.0%/62.6%，在 step250 的差距最大（-3.2pp）；
+mixed p=0.5 为 61.0%/61.8%/62.3%/62.3%/63.3%/63.4%，在 step200 反而高
+0.5pp，step300 低 0.8pp。当前证据是“纯 fused 不如 EOPD，mixed 接近但尚未超过”，
+而不是所有 CacheEOPD 都远远不如 EOPD。此前 64%--66% 的 mixed p=0.25/0.75 结果
+属于离线 teacher-trajectory SFT，不是本阶段正确 EOPD+C2C 协议，不能与这里直接混比。
+
+### 阶段二十四：SFT mixed 与 EOPD+C2C 融合细节复核（2026-08-05）
+
+对照 `train_student_distill.py`、`train_eopd_cacheeopd_hf.py`、`fused_kv.py` 和官方
+`rosetta/model/projector.py` 后，未发现当前正式 HF EOPD+C2C 训练中的层索引或 KV 形状
+映射错误：Qwen3-0.6B 学生 28 层逐层使用 `projector_0..27`，每个学生层 `i` 对应
+Qwen3-4B 教师层 `8+i`，即 `last_aligned`，与官方 C2C 配置一致；teacher/student 的
+KV head 数和 head dimension 也分别从模型配置自动读取。
+
+门控需要区分两层含义：`mixed/anneal` 的概率门控决定本次 rollout 是否使用 fused KV；
+官方 projector 内部的 `key_gate_logit/value_gate_logit` 是每个 projector 的两个层级
+开关，eval 时按 `logit > 0` 硬门控，另外还有按 token、KV head 计算的 sigmoid scalar
+权重。两版都冻结官方 projector 并置于 eval，因此使用的是同一套硬门控；此前检查到
+官方 fuser 的 key gate 为 27/28 层开启、value gate 为 28/28 层开启，而不是训练时每个
+token 重新随机开关。
+
+两版的 KV 边界也已对齐：只融合 prompt 的前 `L-1` 个 token，最后一个 prompt token
+保留学生自身 KV，并在 decode 首步重新喂入。此前新版 EOPD 有一个真正的上下文不一致：
+fused rollout 的 old log-prob 来自 fused prefix，但 current log-prob 曾经用 plain full
+forward 计算；现已改为 `student_fused_response_logits`，使 old/current 都在同一个 fused
+prefix 下计算。
+
+需要明确的是，SFT mixed 与 EOPD mixed 不是同一个 loss：旧版按 micro-batch 决定是否
+融合并对 teacher trajectory 做 response CE；新版按 rollout 决定是否融合，随后仍对学生
+自己生成的 response 使用 EOPD 的 clipped reverse-KL 和 entropy-gated top-k forward-KL。
+这是训练目标的有意差异，不是 projector 映射差异。
+
+另外修正了 `c2c_hf_rollout.py` 的潜在默认值：当 vLLM/HF 适配层未显式传 mapping 时，现
+默认使用官方 fuser 的 `last_aligned`，避免它意外退回 `relative_depth`。正式独立脚本
+`train_eopd_cacheeopd_hf.py` 本身已经显式指定 `last_aligned`。
+
+### 阶段二十五：修复后优先重跑 mixed（2026-08-05）
+
+用户决定优先验证表现最稳定的 `mixed p=0.5`。远端原有 v2 任务已确认加载修复后的
+`train_eopd_cacheeopd_hf.py`：`mixed-41717` 在 GPU2 运行，日志已出现 fused 与 plain
+两类 rollout；`fused-41717`、`anneal-41717`、`fused-41718` 继续运行。为不等待第一波
+结束，`mixed-41718` 已提前调度到 GPU3，使用同一官方 projector、300 steps、每 50 步
+保存和 500 题 student-only 评测协议。
+
+第一次手动启动因遗漏 `PYTHONPATH=/home/kejiechen/CacheEOPD` 立即退出，未生成 checkpoint；
+已记录为启动错误并修正，第二次启动正常进入模型加载和 GPU3 训练。旧 runner 调度壳已停止，
+不影响正在运行的训练进程，以避免后续重复启动 `mixed-41718`。
+
+`mixed-41719` 原计划继续抢占空闲 GPU0，但检查发现 GPU0 被其他用户进程 PID 3771587
+占用约 46.9GB；任务在模型加载阶段 OOM 后立即退出，未生成 checkpoint，未触碰该进程。
+待自有 GPU 释放后再启动 seed41719。
+
+09:40 状态：`mixed-41717=step110`、`mixed-41718=step20`；同一批次的
+`fused-41717=step120`、`anneal-41717=step120`、`fused-41718=step130`。GPU1/2/3/4/5
+均为 kejiechen 自有训练，GPU0 仍由其他用户占用。按当前吞吐，单个 300-step 训练约
+35--45 分钟，训练完成后六个 500 题 checkpoint 评测预计再需 30--90 分钟；三个 mixed
+seed 的完整结果预计约 2--3 小时。远端已启动十分钟状态记录器。
+
+09:53 状态：`mixed-41717=step210`、`mixed-41718=step120`；`fused-41717=step220`、
+`anneal-41717=step220`、`fused-41718=step240`。mixed 两个训练日志均持续产生非零
+`pg_loss`/`soft_kd_loss`，没有 NaN 或进程异常；当前已保存 mixed-41717 的 step50/100/150/200，
+mixed-41718 的 step50/100。训练尚未完成，因此暂时没有新的准确率结果。
+
+10:02 状态：`anneal-41717` 已训练完成并保存到 step300，`fused-41718` 也已完成 300 步；
+`fused-41717=step290`、`mixed-41717=step280`、`mixed-41718=step190` 仍在训练。GPU4
+和 GPU5 已转入 step50 的 500 题 student-only 评测，GPU1/2/3 继续训练；当前评测结果
+文件尚未完成，因此暂时仍无新的准确率数字。
+
+10:12 状态：`fused-41717`、`mixed-41717`、`anneal-41717` 和 `fused-41718` 均已完成
+step300；`mixed-41718=step270`，预计很快完成。GPU1/2/4/5 正在并行评测各自的 step50
+checkpoint，GPU3 继续训练 mixed-41718；目前尚未产生完整 JSONL 评测文件，准确率仍待评测
+进程完成后统计。
+
+10:44 状态：五个训练条件均已完成 300 步，当前 5 个 GPU 评测进程运行中，其中 GPU3
+刚开始补跑 `mixed-41718` 的 step50--300 评测。已完成 11 个 500 题评测文件，初步计数为：
+`anneal-41717` step50/100/150 = 310/304/308，`fused-41717` = 309/295/305，
+`fused-41718` = 307/314/296，`mixed-41717` step50/100 = 305/311。它们只是部分
+checkpoint 结果，不能替代完整六步汇总。
+
+10:51 状态：已完成 12 个 checkpoint 评测文件；新增 `mixed-41717 step150=316/500`。
+当前部分序列为：`fused-41717` step50/100/150=`309/295/305`，`mixed-41717`=`305/311/316`，
+`anneal-41717`=`310/304/308`，`fused-41718`=`307/314/296`。GPU1/2/4/5 继续评测已有
+checkpoint，GPU3 正在补跑 `mixed-41718`；其余 step200--300 仍未完成，不能据此下最终结论。
+
+11:19 状态：已完成 22/30 个 checkpoint 评测。当前新增结果：`anneal-41717` step200/250
+为 `320/314`，`fused-41717` step200/250 为 `304/303`，`fused-41718` step200/250 为
+`300/308`，`mixed-41717` step200/250 为 `312/317`，`mixed-41718` step100=`303`。
+当前仍有 6 个评测进程运行，剩余主要是四个 step300 以及 mixed-41718 的 step150--300。
+
+11:23 查询：step300 评测文件尚未完成；`fused-41717`、`fused-41718`、`anneal-41717`、
+`mixed-41717` 的 step300 正在 GPU1/2/4/5 并行评测。`mixed-41718` 的 step150 评测在
+GPU3 运行，约已处理 400/500 个样本，完成后继续 step200--300。
+
+GPU2 实时查询：`mixed-41717 step300` 已处理 `440/500` 题，暂时正确 `269` 题；进程
+仍在运行，当前中间准确率约 61.1%，尚不是最终结果。
+
+11:31 mixed 更新：`mixed-41717` 六个 checkpoint 已完成，准确率为
+`305/311/316/312/317/310`，平均 `311.8/500=62.37%`；`mixed-41718` 已完成
+step50/100/150=`305/303/307`，step200--300 仍在 GPU3 评测。旧 runner 曾错误重启
+一个 GPU1 的重复 mixed-41718 训练，但它只运行到 step20、尚未保存 checkpoint，已停止，
+不会覆盖 GPU3 版本的已保存 checkpoint。
+
+### 阶段二十六：rollout 直接收益诊断（2026-08-05）
+
+为回答“teacher-fused KV 是否真的让学生当场生成更好的答案”，启动固定 500 题的配对
+评测：同一学生初始 checkpoint、同一题目，分别用 plain student KV 和 official fuser
+生成，均采用 greedy decode，层映射显式固定为 `last_aligned`。输出逐题记录 plain/fused
+答案，统计 both-correct、plain-only-correct、fused-only-correct、both-wrong 以及净提升。
+该测试不改变学生权重，也不把 teacher KV 带入最终 student-only 评测。
+
+远端任务 `rollout_gain_20260805/base_plain_vs_fused_500.jsonl` 已在 GPU1 启动；完成后
+再根据 fused-only 与 plain-only 的配对覆盖率决定是否实现“fused 有益才保留，否则回退
+plain”的自适应 rollout 训练。

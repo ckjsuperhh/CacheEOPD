@@ -123,6 +123,49 @@ actor_rollout_ref:
       layer_mapping: last_aligned          # 官方 C2C；旧 v6 checkpoint 改为 relative_depth
 ```
 
+## vLLM V1 packet injection
+
+HF 的 `past_key_values` 不能直接传给 vLLM。vLLM 路径使用 V1 KV connector：先用
+`prepare_vllm_kv_packet.py` 生成 student-shaped fused KV，再通过
+`SamplingParams.extra_args.kv_transfer_params` 传入 packet 路径。connector 会把前
+`L-1` 个 prompt token 的 KV 写入 vLLM 的 paged cache，再让 vLLM 正常计算最后一个
+prompt token；这样首个 response token 的 logits 仍然正确，也不会重复覆盖 fused KV。
+
+```bash
+PYTHONPATH=. python -m cache_eopd.prepare_vllm_kv_packet \
+  --student <student_path> --teacher <teacher_path> \
+  --input-ids prompt.pt --output /dev/shm/cacheeopd/request-001.pt \
+  --fuser-dir <official_fuser>/final
+```
+
+先验证 paged-cache 映射时可运行：
+
+```bash
+PYTHONPATH=. python -m cache_eopd.smoke_test_vllm_connector
+```
+
+在远端 vLLM 环境中运行完整 engine smoke：
+
+```bash
+CUDA_VISIBLE_DEVICES=1 VLLM_USE_V1=1 VLLM_WORKER_MULTIPROC_METHOD=spawn \
+PYTHONPATH=. python -m cache_eopd.smoke_test_vllm_engine \
+  --model /path/to/Qwen3-0.6B
+```
+
+请求参数需要包含：
+
+```python
+{"kv_transfer_params": {
+    "packet_path": "/dev/shm/cacheeopd/request-001.pt",
+    "prompt_len": 128,
+}}
+```
+
+配置 `actor_rollout_ref.rollout.c2c.enable=True` 后，vLLM 会强制启用
+`CacheEOPDConnector`、关闭 chunked prefill/prefix caching，并在 packet 缺失时直接报错，
+避免把未注入的普通 vLLM 结果误记为 CacheEOPD。当前 packet 生成器是 correctness-first 的
+独立入口；下一步再把它绑定到 EOPD 当前 student 权重同步与每个 rollout request。
+
 ## 待办
 
 - [x] 训练 projector —— held-out per-token KL 降 55%，见 [PROGRESS.md](PROGRESS.md)
@@ -131,4 +174,5 @@ actor_rollout_ref:
       需设 `return_teacher_logits=True`）接入 `core_algos.compute_policy_loss_on_policy_distill`
       的 token 重要性加权
 - [ ] 端到端 EOPD 训练跑通（需完整 verl 环境 + ray）
-- [ ] 路线 B：vLLM/SGLang server 内注入 fused KV（规模化）
+- [x] 路线 B 第一阶段：vLLM V1 connector、paged KV 写入和 packet 生成入口
+- [ ] 路线 B 第二阶段：把 packet 生成绑定到 EOPD 在线 student 权重与 rollout request

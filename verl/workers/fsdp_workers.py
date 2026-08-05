@@ -842,7 +842,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if self._is_actor:
             actor_cfg = omega_conf_to_dataclass(self.config.actor)
             self.actor = DataParallelPPOActor(
-                config=actor_cfg, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer
+                config=actor_cfg,
+                actor_module=self.actor_module_fsdp,
+                actor_optimizer=self.actor_optimizer,
+                tokenizer=self.tokenizer,
             )
 
         if self._is_rollout:
@@ -872,7 +875,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             with open_dict(self.config.ref):
                 self.config.ref.use_remove_padding = use_remove_padding
                 self.config.ref.use_fused_kernels = use_fused_kernels
-            self.ref_policy = DataParallelPPOActor(config=self.config.ref, actor_module=self.ref_module_fsdp)
+            self.ref_policy = DataParallelPPOActor(
+                config=self.config.ref,
+                actor_module=self.ref_module_fsdp,
+                tokenizer=self.tokenizer,
+            )
             # 【EOPD 核心】在 EOPD 中，此 ref worker 实际承载「教师模型」：
             # ray_trainer 已把 config.ref 的模型路径替换为 teacher_model.path 并去掉 optimizer，
             # 因此这里的 ref_policy 就是冻结的教师，仅做前向、不参与梯度更新。

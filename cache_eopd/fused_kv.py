@@ -25,6 +25,8 @@ past_key_values 传入，attention 自然使用它。
 """
 
 from dataclasses import dataclass
+import os
+import re
 from typing import Optional
 
 import torch
@@ -505,6 +507,29 @@ def load_projector_ckpt(path: str) -> nn.ModuleList:
         p.load_state_dict(state)
         mods.append(p)
     return nn.ModuleList(mods)
+
+
+def load_official_fuser_projectors(directory: str) -> nn.ModuleList:
+    """Load the per-layer projector files emitted by the official C2C trainer."""
+    files = [
+        name for name in os.listdir(directory)
+        if re.fullmatch(r"projector_\d+\.pt", name)
+    ]
+    files.sort(key=lambda name: int(re.search(r"projector_(\d+)", name).group(1)))
+    if not files:
+        raise FileNotFoundError(f"No projector_*.pt files found in {directory}")
+
+    projectors = []
+    for filename in files:
+        index = int(re.search(r"projector_(\d+)", filename).group(1))
+        json_path = os.path.join(directory, f"projector_{index}.json")
+        projector = load_projector(json_path)
+        state_dict = torch.load(
+            os.path.join(directory, filename), map_location="cpu", weights_only=True
+        )
+        projector.load_state_dict(state_dict)
+        projectors.append(projector)
+    return nn.ModuleList(projectors)
 
 
 def _get_layer_kv(cache, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:

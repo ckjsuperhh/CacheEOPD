@@ -87,6 +87,9 @@ def parse_args():
                    help="anneal 结束 KV 概率")
     p.add_argument("--anneal-steps", type=int, default=None,
                    help="anneal 概率退火步数，默认使用总训练步数")
+    p.add_argument("--anneal-schedule", choices=["linear", "quadratic", "sqrt"],
+                   default="linear",
+                   help="anneal 进度曲线：linear、quadratic 或 sqrt")
     p.add_argument("--fusion-scale", type=float, default=1.0,
                    help="融合强度（仅 fused 模式生效）")
     p.add_argument("--layer-mapping", choices=["last_aligned", "k_nearest", "relative_depth"],
@@ -339,6 +342,10 @@ def main():
             return 0.0 if args.mode == "plain" else args.fused_prob
         total = max(1, args.anneal_steps or args.steps)
         progress = min(1.0, step / total)
+        if args.anneal_schedule == "quadratic":
+            progress = progress ** 2
+        elif args.anneal_schedule == "sqrt":
+            progress = progress ** 0.5
         return args.anneal_start_prob + progress * (
             args.anneal_end_prob - args.anneal_start_prob
         )
@@ -354,7 +361,8 @@ def main():
     # ---- 训练循环 ----
     print(f"[train] mode={args.mode} steps={args.steps} lr={args.lr} "
           f"grad_accum={args.grad_accum} fused_prob(0)={fused_probability(0):.3f} "
-          f"fused_prob(final)={fused_probability(args.steps):.3f}", flush=True)
+          f"fused_prob(final)={fused_probability(args.steps):.3f} "
+          f"anneal_schedule={args.anneal_schedule}", flush=True)
     global_step = 0
     idx = 0
     accum_ce, accum_n, accum_fused = 0.0, 0, 0

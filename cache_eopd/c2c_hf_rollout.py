@@ -31,6 +31,7 @@ from cache_eopd.fused_kv import (
     FusedKVBuilder,
     FusedKVConfig,
     _get_layer_kv,
+    load_official_fuser_projectors,
     load_projector_ckpt,
 )
 
@@ -79,12 +80,13 @@ class C2CHFRollout(HFRollout):
                 dtype=torch.bfloat16,
                 zero_init=bool(c2c_cfg.get("zero_init", False)),
                 layer_mapping_strategy=c2c_cfg.get(
-                    "layer_mapping", c2c_cfg.get("mapping", "relative_depth")
+                    "layer_mapping", c2c_cfg.get("mapping", "last_aligned")
                 ),
             )
             # module 可能是 FSDP 包装的；FusedKVBuilder 只在 summon_full_params 上下文内调用
             self._fkv_cfg = fkv_cfg
             self._projector_path = c2c_cfg.get("projector_path", None)
+            self._fuser_dir = c2c_cfg.get("fuser_dir", None)
 
     # ------------------------------------------------------------------
     # BaseRollout 的三个抽象方法是给 async server 后端（vllm/sglang）用的：
@@ -104,10 +106,14 @@ class C2CHFRollout(HFRollout):
         """惰性构造 FusedKVBuilder（需要 student config，且 FSDP 下要在 summon 上下文内）。"""
         if self._builder is None:
             projectors = None
+            if self._projector_path and self._fuser_dir:
+                raise ValueError("projector_path and fuser_dir are mutually exclusive")
             if self._projector_path:
                 # train_projector.py 存的是 per-layer 的 ModuleList（28 个 projector），
                 # 结构必须由 ckpt 决定而不是 config，否则形状对不上会静默走随机权重。
                 projectors = load_projector_ckpt(self._projector_path)
+            elif self._fuser_dir:
+                projectors = load_official_fuser_projectors(self._fuser_dir)
             self._builder = FusedKVBuilder.from_models(
                 self.teacher_module, student_module, self._fkv_cfg, projector=projectors)
             self._builder.projectors.eval()  # 硬门控，与验收口径一致

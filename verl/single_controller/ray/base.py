@@ -31,6 +31,7 @@ EOPD 视角：ray_trainer 里的 `self.actor_rollout_wg`、`self.ref_policy_wg` 
 「教师前向」compute_ref_log_prob 就是一次 wg.execute(...) 的远程调用。
 """
 import logging
+import inspect
 import os
 import socket
 from copy import deepcopy

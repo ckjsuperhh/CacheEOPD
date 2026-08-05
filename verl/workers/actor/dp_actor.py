@@ -46,8 +46,6 @@ import torch
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.tensor import DTensor
-from transformers import AutoTokenizer
-
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
@@ -78,11 +76,18 @@ class DataParallelPPOActor(BasePPOActor):
         actor_optimizer (torch.optim.Optimizer, optional): Actor optimizer. Defaults to None.
     """
 
-    def __init__(self, config: ActorConfig, actor_module: nn.Module, actor_optimizer: torch.optim.Optimizer = None):
+    def __init__(
+        self,
+        config: ActorConfig,
+        actor_module: nn.Module,
+        actor_optimizer: torch.optim.Optimizer = None,
+        tokenizer=None,
+    ):
         """When optimizer is None, it is Reference Policy"""
         super().__init__(config)
         self.actor_module = actor_module
         self.actor_optimizer = actor_optimizer
+        self.tokenizer = tokenizer
         role = "Ref" if actor_optimizer is None else "Actor"
 
         self.use_remove_padding = self.config.get("use_remove_padding", False)
@@ -114,23 +119,6 @@ class DataParallelPPOActor(BasePPOActor):
         else:
             self.scaler = None
 
-        # Load tokenizer for debugging
-        print(f"DEBUG: Attempting to load tokenizer on rank {torch.distributed.get_rank()}")
-        
-        model_path = "Qwen/Qwen3-1.7B-Base" # Default/Fallback
-        if hasattr(self.config, 'model'):
-             if hasattr(self.config.model, 'path'):
-                 model_path = self.config.model.path
-        
-        print(f"DEBUG: Using model path: {model_path}")
-
-        try:
-            self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-            print(f"DEBUG: Tokenizer loaded successfully on rank {torch.distributed.get_rank()}")
-        except Exception as e:
-            print(f"ERROR: Failed to load tokenizer for debugging on rank {torch.distributed.get_rank()}: {e}")
-            self.tokenizer = None
-            
         self.debug_file_path = f"actor_debug_rank_{torch.distributed.get_rank()}.jsonl"
         self.debug_file = open(self.debug_file_path, "w")
         print(f"DEBUG: Logging to {self.debug_file_path}")

@@ -23,9 +23,8 @@ Actor / 策略损失相关配置（verl dataclass 配置）。
 【EOPD 核心】EOPD 蒸馏相关配置集中在 `PolicyLossConfig`：
 - `loss_mode = "on_policy_distill"`：开启 EOPD 蒸馏损失（路由到 core_algos 的对应实现）
 - `soft_kd_student_full_vocab`：学生 top-k log-probs 是否在全词表上做 log_softmax（影响 forward-KL 计算）
-- `soft_kd_entropy_threshold` / `soft_kd_loss_coef` / `soft_kd_topk`：由 yaml 透传，
-  在 core_algos.compute_policy_loss_on_policy_distill 内通过 config.get 动态读取
-  （注意：后三者未在此 dataclass 中声明，而是直接从 DictConfig 读取，便于实验调参不改动代码）
+- `soft_kd_entropy_threshold` / `soft_kd_loss_coef`：由 yaml 透传，并在
+  `core_algos.compute_policy_loss_on_policy_distill` 中读取。
 """
 
 from dataclasses import dataclass, field
@@ -99,6 +98,10 @@ class PolicyLossConfig(BaseConfig):
         soft_kd_student_full_vocab (bool): If True, student top-k log-probs are gathered
             from full-vocab log_softmax (no top-k re-normalization). If False, student
             top-k logits are re-normalized within top-k (default behavior).
+        soft_kd_entropy_threshold (Optional[float]): Teacher entropy threshold for the
+            entropy-gated forward-KL term. If None, the loss implementation uses its default.
+        soft_kd_loss_coef (Optional[float]): Coefficient for the forward-KL term. If None,
+            the loss implementation uses its default.
     """
 
     loss_mode: str = "vanilla"
@@ -110,6 +113,8 @@ class PolicyLossConfig(BaseConfig):
     overlong_cache_len: Optional[int] = None
     max_response_length: Optional[int] = None
     soft_kd_student_full_vocab: bool = False
+    soft_kd_entropy_threshold: Optional[float] = None
+    soft_kd_loss_coef: Optional[float] = None
     # 【EOPD 核心】forward-KL 蒸馏中学生 log_prob 的计算方式：
     # - False（默认）：学生只在教师 top-k 词汇子集内做 log_softmax 并重归一化，
     #   与教师 logits 的截断区间对齐，数值更稳定；
