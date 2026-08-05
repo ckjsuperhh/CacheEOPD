@@ -16,4 +16,4 @@ sphinx-markdown-tables  # Sphinx 扩展：渲染 Markdown 格式的表格
 sphinx-rtd-theme        # sphinx-rtd-theme：Read the Docs 标准文档主题
 
 # 固定 tokenizers 版本以避免 env_logger 版本冲突
-tokenizers==0.21        # HuggingFace Tokenizers（固定版本避免依赖冲突）
+tokenizers==0.23.1        # HuggingFace Tokenizers（固定版本避免依赖冲突）
