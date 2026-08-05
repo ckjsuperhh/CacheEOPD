@@ -2184,3 +2184,36 @@ step50/100/150=`305/303/307`，step200--300 仍在 GPU3 评测。旧 runner 曾�
 远端任务 `rollout_gain_20260805/base_plain_vs_fused_500.jsonl` 已在 GPU1 启动；完成后
 再根据 fused-only 与 plain-only 的配对覆盖率决定是否实现“fused 有益才保留，否则回退
 plain”的自适应 rollout 训练。
+
+### 阶段二十七：论文尺度 vLLM 交付包与在线注入边界（2026-08-05）
+
+按“只比较 EOPD 与 CacheEOPD”重新整理了
+`experiments/full_scale_cacheeopd/`：
+
+- `setup_conda_env.sh`：创建 Conda 环境并安装 vLLM `>=0.13.0`、verl/EOPD 与数学评测依赖；
+- `prepare_c2c_projector_data.py`：把 C2C 使用的 `teknium/OpenHermes-2.5` 转成 projector
+  训练所需的 `messages/prompt/solution` JSONL；
+- `train_projector_8b_to_1p7b.sh`：冻结 Qwen3-8B/Qwen3-1.7B，按 C2C 的三层、1024 宽、
+  `lr=1e-4`、`grad_accum=8`、`last_aligned` 配置预训练 projector；
+- `run_eopd_cacheeopd_vllm.sh`：固定论文复现记录中的 EOPD 参数（MATH、top-k 16、
+  entropy 0.8、soft-KD 1.0、batch/mini-batch 128/32、3 epoch、保存间隔 50），并把
+  student/teacher/projector/data/GPU 路径集中到 `env.example`；
+- README 与实验计划明确最终评测只加载 student checkpoint，使用 MATH500、AMC23、
+  Minerva、OlympiadBench、AIME24、AIME25 的 `k=8`、temperature 1.0、top-p 0.8、
+  max tokens 8192，报告 Avg@8 与 Pass@8。
+
+静态验收通过：三个 shell 启动器 `bash -n`、两个修改/新增 Python 文件 AST 解析、
+`git diff --check` 均成功。当前工作区是只读挂载，`py_compile` 不能写 `__pycache__`，
+故未在本地生成字节码；这不代表 Python 语法失败。
+
+必须保留的结论：vLLM V1 connector 已在真实 engine smoke 中验证
+`fused packet -> paged KV -> decode`，但这只是**静态 packet**。正式训练时 student 权重会在每次
+优化后变化；现有 async server 不会为每个 request 用“当前已同步的 vLLM student 权重”生成
+teacher KV、student KV 和 fused packet。因此不能把静态初始 checkpoint 的 packet 重复用于多步
+CacheEOPD 训练，也不能把它作为正式 EOPD 对照结果。
+
+为防止静默退化，交付脚本目前允许 EOPD 正常启动，而 `cacheeopd` 分支会明确退出并说明该
+在线 provider 缺口。下一项工程工作必须位于 vLLM model-runner/prefill 路径：以当前同步权重
+取得 student prefix KV，计算同 prompt 的 teacher prefix KV，经 frozen projector 融合后在最后一
+个 prompt token prefill 前回写 paged KV；完成后需做“更新一次 student 权重后，packet 与当前
+模型对应”的 smoke，才可启动论文尺度 CacheEOPD。

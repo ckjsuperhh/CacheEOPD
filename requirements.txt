@@ -23,7 +23,7 @@ ray[default]         # Ray 分布式计算框架，verl 的核心任务调度引
 tensordict>=0.8.0,<=0.10.0,!=0.9.0  # PyTorch 张量字典，RL 训练中传递 batch 数据
 torchdata            # PyTorch 数据加载与预处理工具库
 transformers         # HuggingFace Transformers，LLM 模型加载、推理和微调
-# vllm==0.8.4        # vLLM 推理引擎（此处注释掉，通过 extras 安装）
+# vllm>=0.13.0       # CacheEOPD V1 connector 需要的 vLLM 版本
 wandb                # Weights & Biases 实验追踪与可视化平台
 packaging>=20.0      # Python 包版本解析与比较工具
 uvicorn              # ASGI 服务器，用于奖励模型/教师模型的 API 服务

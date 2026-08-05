@@ -147,7 +147,7 @@ def build_samples(rows, tok, args):
         prompt, solution = r.get("prompt"), r.get("solution")
         if not prompt or not solution:
             continue
-        msgs = [{"role": "user", "content": prompt}]
+        msgs = r.get("messages") or [{"role": "user", "content": prompt}]
         try:
             instruction = tok.apply_chat_template(
                 msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False)

@@ -61,7 +61,7 @@ PRIME_REQUIRES = ["pyext"]                # PRIME 算法所需的扩展依赖
 GEO_REQUIRES = ["mathruler", "torchvision", "qwen_vl_utils"]  # 几何/视觉推理相关依赖
 GPU_REQUIRES = ["liger-kernel", "flash-attn"]                  # GPU 加速依赖（Flash Attention 等）
 MATH_REQUIRES = ["math-verify"]           # 数学答案验证库，用于数学推理任务的奖励计算
-VLLM_REQUIRES = ["tensordict>=0.8.0,<=0.10.0,!=0.9.0", "vllm>=0.8.5,<=0.12.0"]  # vLLM 推理引擎依赖
+VLLM_REQUIRES = ["tensordict>=0.8.0,<=0.10.0,!=0.9.0", "vllm>=0.13.0"]  # CacheEOPD V1 connector 依赖
 SGLANG_REQUIRES = [
     "tensordict>=0.8.0,<=0.10.0,!=0.9.0",
     "sglang[srt,openai]==0.5.6",          # SGLang 推理引擎（替代 vLLM 的选项）

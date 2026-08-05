@@ -8,19 +8,16 @@ teacher-assisted accuracy; it is student-only accuracy after training.
 
 ## Frozen comparison
 
-Run all arms with the same student, teacher, official projector, prompts, response token
+Run only the following two arms with the same student, teacher, prompts, response token
 budget, optimizer updates, data order policy, checkpoint interval, and evaluation set.
 
-1. `plain_sft`: offline teacher trajectory response CE, student KV only.
-2. `eopd`: student on-policy rollout plus official EOPD loss without KV injection.
-3. `cacheeopd_mixed`: EOPD loss, fused rollout probability `0.5`.
-4. `cacheeopd_adaptive`: EOPD loss, choose fused or plain rollout using a frozen scoring rule.
+1. `eopd`: student on-policy rollout plus the official EOPD loss, with ordinary student KV.
+2. `cacheeopd`: exactly the same EOPD loss and budget, but its rollout starts from a
+   C2C-fused teacher/student KV prefix produced by a frozen projector.
 
-The adaptive arm is conditional. First run the paired rollout diagnostic. During training,
-ground-truth labels may be used for offline analysis only, never to select trajectories.
-The training selector should use normalized teacher sequence log-probability, EOPD
-advantage, and an explicit margin. The selected rollout context must also be used for both
-old and current student log-probabilities.
+`plain_sft`, mixed-probability injection, annealing, adaptive selection, and any
+teacher-assisted evaluation are deliberately outside this full-scale package. They are
+pilot ablations, not part of the requested EOPD-versus-CacheEOPD comparison.
 
 ## Required reporting
 
@@ -28,7 +25,8 @@ For each seed and checkpoint, report:
 
 - accuracy, answer extraction failures, and mean response length;
 - paired `both_correct`, `plain_only_correct`, `fused_only_correct`, and `both_wrong`;
-- fused rollout rate, fallback rate, teacher score margin, and score/correctness correlation;
+- fused rollout rate and a hard failure count (a CacheEOPD request must never silently
+  fall back to ordinary student KV);
 - optimizer updates, response tokens, wall-clock time, and peak GPU memory;
 - best checkpoint and fixed-step checkpoint separately.
 
@@ -40,11 +38,13 @@ Do not spend full-scale resources until these checks pass:
 2. Paired rollout evaluation uses explicit `last_aligned` mapping and student-only final evaluation.
 3. Three seeds complete a small pilot without NaN, checkpoint loss, or duplicate runners.
 4. The same token/update budget is used for EOPD and CacheEOPD.
-5. Adaptive selection has positive paired coverage, or it is removed from the main run.
+5. CacheEOPD has passed an online vLLM rollout smoke using the current synchronized
+   student weights. A static KV-packet smoke is necessary but not sufficient.
 
 ## Suggested stages
 
-- Smoke: 10 steps, 32 prompts, one GPU.
+- Smoke: 10 steps, 32 prompts, one GPU for EOPD; CacheEOPD also needs a current-weight
+  online injection smoke.
 - Pilot: 300 steps, 500 evaluation questions, seeds `41717`, `41718`, `41719`.
 - Medium: 1,000--2,000 updates, 2,048-token context, three seeds.
 - Large: 4,096-token context and the agreed data scale, only after the medium report.
