@@ -25,7 +25,7 @@ torchdata            # PyTorch 数据加载与预处理工具库
 transformers         # HuggingFace Transformers，LLM 模型加载、推理和微调
 # vllm>=0.13.0       # CacheEOPD V1 connector 需要的 vLLM 版本
 wandb                # Weights & Biases 实验追踪与可视化平台
-packaging>=20.0      # Python 包版本解析与比较工具
+packaging>=26.2      # Python 包版本解析与比较工具
 uvicorn              # ASGI 服务器，用于奖励模型/教师模型的 API 服务
 fastapi              # 高性能 Web 框架，用于构建模型推理 API 服务
 latex2sympy2_extended # LaTeX 到 SymPy 的转换工具（扩展版），用于数学表达式解析
