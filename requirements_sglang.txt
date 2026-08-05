@@ -18,7 +18,7 @@ pyarrow>=19.0.0      # Parquet 文件读写库
 pybind11             # C++/Python 互操作绑定
 pylatexenc           # LaTeX 编解码工具
 ray[default]>=2.10   # Ray 分布式计算框架（要求 >=2.10）
-tensordict>=0.8.0,<=0.10.0,!=0.9.0  # 张量字典数据结构
+tensordict!=0.9.0,<=0.13.0,>=0.13.0  # 张量字典数据结构
 torchdata            # PyTorch 数据加载工具
 torchvision          # PyTorch 计算机视觉库（多模态模型需要）
 transformers         # HuggingFace Transformers 模型库

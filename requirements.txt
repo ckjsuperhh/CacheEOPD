@@ -20,7 +20,7 @@ pybind11             # C++/Python 互操作绑定工具，用于编译 C++ 扩�
 pylatexenc           # LaTeX 编解码库，用于数学推理任务中的公式处理
 pre-commit           # Git pre-commit 钩子管理工具，确保代码提交前通过检查
 ray[default]         # Ray 分布式计算框架，verl 的核心任务调度引擎
-tensordict>=0.8.0,<=0.10.0,!=0.9.0  # PyTorch 张量字典，RL 训练中传递 batch 数据
+tensordict!=0.9.0,<=0.13.0,>=0.13.0  # PyTorch 张量字典，RL 训练中传递 batch 数据
 torchdata            # PyTorch 数据加载与预处理工具库
 transformers         # HuggingFace Transformers，LLM 模型加载、推理和微调
 # vllm>=0.13.0       # CacheEOPD V1 connector 需要的 vLLM 版本
