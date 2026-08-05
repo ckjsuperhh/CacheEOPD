@@ -2217,3 +2217,10 @@ CacheEOPD 训练，也不能把它作为正式 EOPD 对照结果。
 取得 student prefix KV，计算同 prompt 的 teacher prefix KV，经 frozen projector 融合后在最后一
 个 prompt token prefill 前回写 paged KV；完成后需做“更新一次 student 权重后，packet 与当前
 模型对应”的 smoke，才可启动论文尺度 CacheEOPD。
+
+### 阶段二十八：仓库结构导读（2026-08-05）
+
+新增仓库根目录 `CODEBASE_GUIDE.md`，集中说明 `verl`、`rosetta`、`cache_eopd`、
+`scripts/eopd` 与论文尺度交付目录的职责；文档还按“EOPD 训练主链路 → C2C fused KV →
+HF research runner → vLLM packet/connector → student-only 评测”的顺序给出阅读路线，
+并明确 vLLM 当前只完成静态 packet 注入、尚缺当前权重在线 packet provider 的工程边界。
